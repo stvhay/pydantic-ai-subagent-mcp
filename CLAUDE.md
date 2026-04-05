@@ -39,6 +39,13 @@ uv run mypy src/           # Type check
 - `srclight` -- Code indexing MCP server (optional, for enhanced code search)
 - `httpx` -- HTTP client for Ollama API
 
+## CI vs local environment
+
+The Nix flake provides `ripgrep` (`rg`) locally, but CI (ubuntu-latest) does not have it.
+Tools like `search_files` must gracefully fall back to `grep` when `rg` is missing.
+When adding tools that shell out to CLI programs, ensure fallback paths are tested
+without those programs available (CI will catch this if local tests don't).
+
 ## Environment variables
 
 - `OLLAMA_BASE_URL` -- Ollama endpoint (default: http://localhost:11434)
