@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "subagent-mcp": {
+      "command": "uv",
+      "args": ["run", "subagent-mcp"],
+      "env": {
+        "OLLAMA_BASE_URL": "${OLLAMA_BASE_URL:-http://localhost:11434}",
+        "SUBAGENT_MCP_DEFAULT_MODEL": "${SUBAGENT_MCP_DEFAULT_MODEL:-gemma4:12b}"
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "ollama_base_url": "http://localhost:11434",
+  "default_model": "gemma4:12b",
+  "session_dir": ".subagent-sessions",
+  "max_iterations": 50,
+  "tool_timeout": 120.0,
+  "srclight_enabled": true
+}

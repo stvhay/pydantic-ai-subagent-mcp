@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.venv/
+
+# Environment
+.envrc.local
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Nix
+result
+result-*
+
+# Project
+.worktrees/
+.srclight/
+
+# OS
+.DS_Store
+Thumbs.db
+.claude/.statusline-stats
