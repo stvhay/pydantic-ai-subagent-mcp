@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import json
 import logging
 import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -27,6 +27,14 @@ _config: ServerConfig | None = None
 _session_store: SessionStore | None = None
 _skills: list[Skill] = []
 
+
+@asynccontextmanager
+async def _lifespan(_app: FastMCP[None]) -> AsyncIterator[None]:
+    """Run async startup tasks before the server begins accepting requests."""
+    await _check_ollama(_get_config())
+    yield
+
+
 mcp_server = FastMCP(
     "subagent-mcp",
     instructions=(
@@ -34,6 +42,7 @@ mcp_server = FastMCP(
         "Each tool corresponds to a discovered skill. Call a skill tool with "
         "your prompt and optionally specify a model and session_id to resume."
     ),
+    lifespan=_lifespan,
 )
 
 
@@ -121,6 +130,7 @@ async def _run_skill(
         }
     except Exception as e:
         error_msg = f"Error running skill '{skill.name}': {e}"
+        logger.exception(error_msg)
         return {
             "session_id": session.session_id,
             "error": error_msg,
@@ -228,10 +238,6 @@ def _initialize() -> None:
 
     _config = ServerConfig.load()
     _session_store = SessionStore(_config.session_dir)
-
-    # Best-effort health check
-    with contextlib.suppress(Exception):
-        asyncio.run(_check_ollama(_config))
 
     logger.info("Discovering skills...")
     _skills = discover_skills()

@@ -80,9 +80,9 @@ class SessionStore:
         self._sessions[session_id] = session
         return session
 
-    def list_sessions(self) -> list[dict[str, str]]:
+    def list_sessions(self) -> list[dict[str, Any]]:
         """List all session IDs and metadata."""
-        sessions: list[dict[str, str]] = []
+        sessions: list[dict[str, Any]] = []
         for path in self.session_dir.glob("*.json"):
             try:
                 data = json.loads(path.read_text())
@@ -91,7 +91,7 @@ class SessionStore:
                     "skill_name": data["skill_name"],
                     "model": data["model"],
                     "created_at": data["created_at"],
-                    "message_count": str(len(data.get("messages", []))),
+                    "message_count": len(data.get("messages", [])),
                 })
             except (json.JSONDecodeError, KeyError):
                 continue
