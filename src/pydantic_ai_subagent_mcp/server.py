@@ -7,6 +7,7 @@ import logging
 import sys
 from typing import Any
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -99,40 +100,25 @@ async def _run_skill(
         effective_model = model or _get_config().default_model
         session = store.create(skill.name, effective_model)
 
-    session.add_message("user", prompt)
-
     agent = _build_agent(skill, model or session.model)
 
-    # Build message history for context
-    message_history_text = ""
-    if len(session.messages) > 1:
-        prior = session.messages[:-1]
-        history_parts = [f"[{m.role}]: {m.content}" for m in prior]
-        message_history_text = (
-            "\n\nPrior conversation in this session:\n" + "\n".join(history_parts)
+    try:
+        result = await agent.run(
+            prompt,
+            message_history=session.messages or None,
         )
 
-    full_prompt = prompt
-    if message_history_text:
-        full_prompt = message_history_text + "\n\nCurrent request:\n" + prompt
-
-    try:
-        result = await agent.run(full_prompt)
-        response_text = result.output
-
-        session.add_message("assistant", response_text)
+        session.messages = result.all_messages()
         store.save(session)
 
         return {
             "session_id": session.session_id,
-            "response": response_text,
+            "response": result.output,
             "model": session.model,
             "skill": skill.name,
         }
     except Exception as e:
         error_msg = f"Error running skill '{skill.name}': {e}"
-        session.add_message("assistant", error_msg)
-        store.save(session)
         return {
             "session_id": session.session_id,
             "error": error_msg,
@@ -220,12 +206,32 @@ async def run_skill_by_name(
     return json.dumps(result, indent=2)
 
 
+async def _check_ollama(config: ServerConfig) -> None:
+    """Non-blocking check that Ollama is reachable at startup."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{config.ollama_base_url}/api/tags", timeout=5.0
+            )
+            resp.raise_for_status()
+            models = resp.json().get("models", [])
+            logger.info("Ollama reachable, %d models available", len(models))
+    except Exception as e:
+        logger.warning("Ollama not reachable at %s: %s", config.ollama_base_url, e)
+
+
 def _initialize() -> None:
     """Discover skills and register them as MCP tools at startup."""
     global _skills, _config, _session_store
+    import asyncio
+    import contextlib
 
     _config = ServerConfig.load()
     _session_store = SessionStore(_config.session_dir)
+
+    # Non-blocking health check
+    with contextlib.suppress(Exception):
+        asyncio.run(_check_ollama(_config))
 
     logger.info("Discovering skills...")
     _skills = discover_skills()
