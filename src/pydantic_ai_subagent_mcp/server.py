@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -24,6 +27,14 @@ _config: ServerConfig | None = None
 _session_store: SessionStore | None = None
 _skills: list[Skill] = []
 
+
+@asynccontextmanager
+async def _lifespan(_app: FastMCP[None]) -> AsyncIterator[None]:
+    """Run async startup tasks before the server begins accepting requests."""
+    await _check_ollama(_get_config())
+    yield
+
+
 mcp_server = FastMCP(
     "subagent-mcp",
     instructions=(
@@ -31,6 +42,7 @@ mcp_server = FastMCP(
         "Each tool corresponds to a discovered skill. Call a skill tool with "
         "your prompt and optionally specify a model and session_id to resume."
     ),
+    lifespan=_lifespan,
 )
 
 
@@ -99,40 +111,26 @@ async def _run_skill(
         effective_model = model or _get_config().default_model
         session = store.create(skill.name, effective_model)
 
-    session.add_message("user", prompt)
-
     agent = _build_agent(skill, model or session.model)
 
-    # Build message history for context
-    message_history_text = ""
-    if len(session.messages) > 1:
-        prior = session.messages[:-1]
-        history_parts = [f"[{m.role}]: {m.content}" for m in prior]
-        message_history_text = (
-            "\n\nPrior conversation in this session:\n" + "\n".join(history_parts)
+    try:
+        result = await agent.run(
+            prompt,
+            message_history=session.messages or None,
         )
 
-    full_prompt = prompt
-    if message_history_text:
-        full_prompt = message_history_text + "\n\nCurrent request:\n" + prompt
-
-    try:
-        result = await agent.run(full_prompt)
-        response_text = result.output
-
-        session.add_message("assistant", response_text)
+        session.messages = result.all_messages()
         store.save(session)
 
         return {
             "session_id": session.session_id,
-            "response": response_text,
+            "response": result.output,
             "model": session.model,
             "skill": skill.name,
         }
     except Exception as e:
         error_msg = f"Error running skill '{skill.name}': {e}"
-        session.add_message("assistant", error_msg)
-        store.save(session)
+        logger.exception(error_msg)
         return {
             "session_id": session.session_id,
             "error": error_msg,
@@ -218,6 +216,20 @@ async def run_skill_by_name(
         session_id=session_id or None,
     )
     return json.dumps(result, indent=2)
+
+
+async def _check_ollama(config: ServerConfig) -> None:
+    """Best-effort check that Ollama is reachable at startup."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{config.ollama_base_url}/api/tags", timeout=5.0
+            )
+            resp.raise_for_status()
+            models = resp.json().get("models", [])
+            logger.info("Ollama reachable, %d models available", len(models))
+    except Exception as e:
+        logger.warning("Ollama not reachable at %s: %s", config.ollama_base_url, e)
 
 
 def _initialize() -> None:

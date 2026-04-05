@@ -7,6 +7,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    UserPromptPart,
+)
 
 from pydantic_ai_subagent_mcp import server
 from pydantic_ai_subagent_mcp.config import ServerConfig
@@ -30,6 +36,17 @@ def _make_skill(tmp_path: Path, name: str = "test-skill") -> Skill:
     return Skill(name=name, description="A test skill", source_path=md)
 
 
+def _make_mock_result(output: str = "Hello from the agent!") -> MagicMock:
+    """Create a mock AgentRunResult with all_messages() support."""
+    mock_result = MagicMock()
+    mock_result.output = output
+    mock_result.all_messages.return_value = [
+        ModelRequest(parts=[UserPromptPart(content="test prompt")]),
+        ModelResponse(parts=[TextPart(content=output)]),
+    ]
+    return mock_result
+
+
 def test_build_model() -> None:
     model = server._build_model("gemma4:12b")
     assert model.model_name == "gemma4:12b"
@@ -48,9 +65,7 @@ def test_build_agent(tmp_path: Path) -> None:
 
 async def test_run_skill_success(tmp_path: Path) -> None:
     skill = _make_skill(tmp_path)
-
-    mock_result = MagicMock()
-    mock_result.output = "Hello from the agent!"
+    mock_result = _make_mock_result()
 
     with patch.object(server, "_build_agent") as mock_build:
         mock_agent = AsyncMock()
@@ -63,6 +78,46 @@ async def test_run_skill_success(tmp_path: Path) -> None:
     assert result["skill"] == "test-skill"
     assert "session_id" in result
     assert "error" not in result
+
+    # Verify agent.run was called with message_history
+    mock_agent.run.assert_called_once()
+    call_kwargs = mock_agent.run.call_args
+    assert call_kwargs[0][0] == "say hello"  # positional prompt arg
+
+
+async def test_run_skill_passes_message_history(tmp_path: Path) -> None:
+    """Verify that resuming a session passes native message_history."""
+    skill = _make_skill(tmp_path)
+
+    # First call — no history
+    mock_result1 = _make_mock_result("Response 1")
+    # Second call — should have history from first call
+    mock_result2 = _make_mock_result("Response 2")
+    mock_result2.all_messages.return_value = [
+        ModelRequest(parts=[UserPromptPart(content="first")]),
+        ModelResponse(parts=[TextPart(content="Response 1")]),
+        ModelRequest(parts=[UserPromptPart(content="second")]),
+        ModelResponse(parts=[TextPart(content="Response 2")]),
+    ]
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=[mock_result1, mock_result2])
+        mock_build.return_value = mock_agent
+
+        result1 = await server._run_skill(skill, "first")
+        session_id = result1["session_id"]
+
+        result2 = await server._run_skill(skill, "second", session_id=session_id)
+
+    assert result2["session_id"] == session_id
+    assert result2["response"] == "Response 2"
+
+    # Second call should have received message_history
+    second_call = mock_agent.run.call_args_list[1]
+    assert second_call.kwargs.get("message_history") is not None
+    history = second_call.kwargs["message_history"]
+    assert len(history) == 2  # request + response from first call
 
 
 async def test_run_skill_error(tmp_path: Path) -> None:
@@ -82,9 +137,7 @@ async def test_run_skill_error(tmp_path: Path) -> None:
 
 async def test_run_skill_resumes_session(tmp_path: Path) -> None:
     skill = _make_skill(tmp_path)
-
-    mock_result = MagicMock()
-    mock_result.output = "Response 1"
+    mock_result = _make_mock_result("Response 1")
 
     with patch.object(server, "_build_agent") as mock_build:
         mock_agent = AsyncMock()
@@ -94,7 +147,8 @@ async def test_run_skill_resumes_session(tmp_path: Path) -> None:
         result1 = await server._run_skill(skill, "first message")
         session_id = result1["session_id"]
 
-        mock_result.output = "Response 2"
+        mock_result2 = _make_mock_result("Response 2")
+        mock_agent.run = AsyncMock(return_value=mock_result2)
         result2 = await server._run_skill(
             skill, "second message", session_id=session_id
         )
@@ -132,3 +186,36 @@ async def test_run_skill_by_name_not_found() -> None:
     result = json.loads(result_json)
     assert "error" in result
     assert "not found" in result["error"]
+
+
+async def test_check_ollama_success() -> None:
+    """Test health check logs success when Ollama is reachable."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"models": [{"name": "gemma4:12b"}]}
+    mock_response.raise_for_status = MagicMock()
+
+    with patch("pydantic_ai_subagent_mcp.server.httpx") as mock_httpx:
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_httpx.AsyncClient.return_value = mock_client
+
+        config = ServerConfig()
+        await server._check_ollama(config)
+
+        mock_client.get.assert_called_once()
+
+
+async def test_check_ollama_failure_logs_warning() -> None:
+    """Test health check logs warning but doesn't raise when Ollama is unreachable."""
+    with patch("pydantic_ai_subagent_mcp.server.httpx") as mock_httpx:
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(side_effect=ConnectionError("refused"))
+        mock_httpx.AsyncClient.return_value = mock_client
+
+        config = ServerConfig()
+        # Should not raise
+        await server._check_ollama(config)
