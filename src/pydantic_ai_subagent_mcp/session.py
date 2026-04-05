@@ -1,4 +1,4 @@
-"""Session management with UUID-keyed transcripts."""
+"""Session management with UUID-keyed transcripts using native pydantic-ai messages."""
 
 from __future__ import annotations
 
@@ -9,51 +9,30 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-
-@dataclass
-class Message:
-    """A single message in a session transcript."""
-
-    role: str
-    content: str
-    timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
-    tool_calls: list[dict[str, Any]] | None = None
-    tool_results: list[dict[str, Any]] | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {
-            "role": self.role,
-            "content": self.content,
-            "timestamp": self.timestamp,
-        }
-        if self.tool_calls:
-            d["tool_calls"] = self.tool_calls
-        if self.tool_results:
-            d["tool_results"] = self.tool_results
-        return d
+from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
 
 
 @dataclass
 class Session:
-    """A session with UUID key and message transcript."""
+    """A session with UUID key and native pydantic-ai message history."""
 
     session_id: str
     skill_name: str
     model: str
     created_at: str
-    messages: list[Message] = field(default_factory=list)
+    messages: list[ModelMessage] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
+        messages_json = json.loads(
+            ModelMessagesTypeAdapter.dump_json(self.messages)
+        )
         return {
             "session_id": self.session_id,
             "skill_name": self.skill_name,
             "model": self.model,
             "created_at": self.created_at,
-            "messages": [m.to_dict() for m in self.messages],
+            "messages": messages_json,
         }
-
-    def add_message(self, role: str, content: str, **kwargs: Any) -> None:
-        self.messages.append(Message(role=role, content=content, **kwargs))
 
 
 class SessionStore:
@@ -88,28 +67,22 @@ class SessionStore:
         if not path.exists():
             return None
         data = json.loads(path.read_text())
+        messages = ModelMessagesTypeAdapter.validate_python(
+            data.get("messages", [])
+        )
         session = Session(
             session_id=data["session_id"],
             skill_name=data["skill_name"],
             model=data["model"],
             created_at=data["created_at"],
-            messages=[
-                Message(
-                    role=m["role"],
-                    content=m["content"],
-                    timestamp=m.get("timestamp", ""),
-                    tool_calls=m.get("tool_calls"),
-                    tool_results=m.get("tool_results"),
-                )
-                for m in data.get("messages", [])
-            ],
+            messages=messages,
         )
         self._sessions[session_id] = session
         return session
 
     def list_sessions(self) -> list[dict[str, str]]:
         """List all session IDs and metadata."""
-        sessions = []
+        sessions: list[dict[str, str]] = []
         for path in self.session_dir.glob("*.json"):
             try:
                 data = json.loads(path.read_text())
