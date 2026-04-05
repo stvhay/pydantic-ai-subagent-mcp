@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import sys
@@ -207,7 +209,7 @@ async def run_skill_by_name(
 
 
 async def _check_ollama(config: ServerConfig) -> None:
-    """Non-blocking check that Ollama is reachable at startup."""
+    """Best-effort check that Ollama is reachable at startup."""
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(
@@ -223,13 +225,11 @@ async def _check_ollama(config: ServerConfig) -> None:
 def _initialize() -> None:
     """Discover skills and register them as MCP tools at startup."""
     global _skills, _config, _session_store
-    import asyncio
-    import contextlib
 
     _config = ServerConfig.load()
     _session_store = SessionStore(_config.session_dir)
 
-    # Non-blocking health check
+    # Best-effort health check
     with contextlib.suppress(Exception):
         asyncio.run(_check_ollama(_config))
 
