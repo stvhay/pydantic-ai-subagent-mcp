@@ -46,13 +46,15 @@ async def search_files(
 ) -> str:
     """Search file contents using ripgrep (or fallback to grep)."""
     try:
-        cmd = ["rg", "--no-heading", "--line-number", "--max-count=50", pattern, path]
-        if glob:
-            cmd.extend(["--glob", glob])
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode == 0:
-            return result.stdout[:10000]
-        # Fallback to grep
+        try:
+            cmd = ["rg", "--no-heading", "--line-number", "--max-count=50", pattern, path]
+            if glob:
+                cmd.extend(["--glob", glob])
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                return result.stdout[:10000]
+        except FileNotFoundError:
+            pass  # rg not installed, fall through to grep
         cmd = ["grep", "-rn", "--max-count=50", pattern, path]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         return result.stdout[:10000] if result.stdout else "No matches found."
