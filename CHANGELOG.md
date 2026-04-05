@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.1.1 (2026-04-05)
 
-<!-- bump: patch -->
+
 
 ### Added
 
