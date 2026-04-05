@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import sys
-from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP

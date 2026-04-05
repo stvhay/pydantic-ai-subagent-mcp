@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +16,7 @@ class Message:
 
     role: str
     content: str
-    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     tool_calls: list[dict[str, Any]] | None = None
     tool_results: list[dict[str, Any]] | None = None
 
@@ -74,7 +74,7 @@ class SessionStore:
             session_id=session_id,
             skill_name=skill_name,
             model=model,
-            created_at=datetime.now(timezone.utc).isoformat(),
+            created_at=datetime.now(UTC).isoformat(),
         )
         self._sessions[session_id] = session
         self._persist(session)

@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from pydantic_ai_subagent_mcp.skills import Skill, discover_skills
+from pydantic_ai_subagent_mcp.skills import discover_skills
 
 
 def test_discover_markdown_skills(tmp_path: Path):
