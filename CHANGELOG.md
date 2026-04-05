@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-<!-- bump: minor -->
+<!-- bump: patch -->
 
 ### Added
 
@@ -13,3 +13,15 @@
 - Claude Code `.mcp.json` for automatic server loading
 - Nix flake + envrc.d development environment
 - Configuration via `.subagent-mcp.json` and environment variables
+- Tests for tools, server, config, session, and skills (28 total)
+- `docs/ARCHITECTURE.md` with system context diagram and ADRs
+- `docs/DESIGN.md` with skill discovery, session, and security patterns
+
+### Fixed
+
+- Build backend (`hatchling.backends` → `hatchling.build`)
+- Ruff lint errors (unused imports, `timezone.utc` → `datetime.UTC`)
+- Mypy strict errors (untyped dict, tool registration type mismatch)
+- Env-dependent test failure in `test_load_from_file`
+- `search_files` grep fallback when ripgrep is not installed
+- CI workflow installs dev dependencies (`uv sync --extra dev`)
