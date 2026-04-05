@@ -6,6 +6,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -23,7 +24,7 @@ class ServerConfig:
     @classmethod
     def load(cls, config_path: Path | None = None) -> ServerConfig:
         """Load config from file and environment overrides."""
-        data: dict = {}
+        data: dict[str, Any] = {}
 
         # Load from config file if provided or default location exists
         if config_path is None:

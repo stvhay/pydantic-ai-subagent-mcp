@@ -23,6 +23,7 @@ result
 result-*
 
 # Project
+.issue
 .worktrees/
 .srclight/
 

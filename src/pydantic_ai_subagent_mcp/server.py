@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import sys
-from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -77,16 +75,11 @@ def _build_agent(skill: Skill, model_name: str | None = None) -> Agent[None, str
         "Be thorough but concise in your responses."
     )
 
-    agent = Agent(
+    return Agent(
         model,
         system_prompt=system_prompt,
+        tools=BUILTIN_TOOLS,  # type: ignore[arg-type]
     )
-
-    # Register built-in tools
-    for tool_fn in BUILTIN_TOOLS:
-        agent.tool()(tool_fn)
-
-    return agent
 
 
 async def _run_skill(
