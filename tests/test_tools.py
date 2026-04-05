@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
+
+from pydantic_ai import RunContext
 
 from pydantic_ai_subagent_mcp.tools import (
     list_files,
@@ -13,8 +16,7 @@ from pydantic_ai_subagent_mcp.tools import (
     write_file,
 )
 
-# Use None as RunContext — tools only use ctx for type compliance
-CTX = None  # type: ignore[assignment]
+CTX: RunContext[None] = MagicMock(spec=RunContext)
 
 
 async def test_read_file(tmp_path: Path) -> None:
