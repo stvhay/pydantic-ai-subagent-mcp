@@ -6,6 +6,10 @@
 
 ### Added
 
+- Streaming skill execution via `agent.run_stream()`, gated by a new `streaming: bool` config field (default `true`) with `SUBAGENT_MCP_STREAMING` env override
+- Per-session append-only `{session_dir}/{session_id}.log` files capturing text deltas with a `--- prompt ---` / `--- response ---` transcript format
+- New `tail_session_log(session_id, offset)` MCP tool for offset-based polling of live stream output
+- Real-Ollama integration test (`tests/test_streaming_integration.py`) that exercises the full streaming path end-to-end; skipped when Ollama is unreachable
 - Initial MCP server with skill discovery and Ollama subagent execution
 - UUID-keyed session management with transcript persistence
 - Built-in tools: file I/O, code search (ripgrep), shell execution
