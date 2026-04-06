@@ -29,3 +29,5 @@
 - Env-dependent test failure in `test_load_from_file`
 - `search_files` grep fallback when ripgrep is not installed
 - CI workflow installs dev dependencies (`uv sync --extra dev`)
+- `docs/DESIGN.md` streaming section: corrected `{uuid}.log` → `{session_id}.log` to match the code and README, and distinguished `SessionStore.tail()`'s `(text, next_offset)` tuple return from the `tail_session_log` MCP tool's `{session_id, text, next_offset}` JSON envelope
+- `_run_skill_streaming` return type tightened from `tuple[str, list[Any]]` to `tuple[str, list[ModelMessage]]`, and a redundant `log_path.parent.mkdir()` was removed (the session directory is already created by `SessionStore.__init__`)
