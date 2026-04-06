@@ -106,3 +106,27 @@ class SessionStore:
         """Save an updated session."""
         self._sessions[session.session_id] = session
         self._persist(session)
+
+    def log_path(self, session_id: str) -> Path:
+        """Return the path to the streaming log file for a session."""
+        return self.session_dir / f"{session_id}.log"
+
+    def tail(
+        self,
+        session_id: str,
+        offset: int = 0,
+        max_bytes: int = 16384,
+    ) -> tuple[str, int]:
+        """Read new bytes from a session log.
+
+        Returns ``(text, new_offset)``. If the log does not exist, returns
+        ``("", 0)``. Partial UTF-8 sequences at read boundaries are decoded
+        with ``errors="replace"``.
+        """
+        path = self.log_path(session_id)
+        if not path.exists():
+            return ("", 0)
+        with path.open("rb") as f:
+            f.seek(offset)
+            data = f.read(max_bytes)
+        return (data.decode("utf-8", errors="replace"), offset + len(data))
