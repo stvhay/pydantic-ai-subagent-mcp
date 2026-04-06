@@ -17,7 +17,7 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.ollama import OllamaProvider
 
 from .config import ServerConfig
-from .session import SessionStore
+from .session import Session, SessionStore
 from .skills import Skill, discover_skills
 from .tools import BUILTIN_TOOLS
 
@@ -98,10 +98,15 @@ def _build_agent(skill: Skill, model_name: str | None = None) -> Agent[None, str
 async def _run_skill_streaming(
     agent: Agent[None, str],
     prompt: str,
-    session: Any,  # Session — kept Any to avoid extra import
+    session: Session,
     store: SessionStore,
 ) -> tuple[str, list[Any]]:
     """Run the agent with streaming and write deltas to the session log.
+
+    Opens ``{session_dir}/{session_id}.log`` in append mode, writes a
+    timestamped ``--- prompt ---`` / ``--- response ---`` header block,
+    then streams text deltas from ``agent.run_stream()`` to the file with
+    per-chunk flush so concurrent tail readers see output in real time.
 
     Returns ``(final_output, all_messages)``.
     """

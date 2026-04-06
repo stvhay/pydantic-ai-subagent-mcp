@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
+from types import TracebackType
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic_ai.messages import (
+    ModelMessage,
     ModelRequest,
     ModelResponse,
     TextPart,
@@ -231,19 +234,20 @@ async def test_check_ollama_failure_logs_warning() -> None:
 class _FakeStreamResult:
     """Minimal fake for pydantic-ai's StreamedRunResult."""
 
-    def __init__(self, chunks: list[str], messages: list) -> None:
+    def __init__(self, chunks: list[str], messages: list[ModelMessage]) -> None:
         self._chunks = chunks
         self._messages = messages
         self._output = "".join(chunks)
 
-    async def stream_text(self, *, delta: bool = False):  # noqa: ARG002
+    async def stream_text(self, *, delta: bool = False) -> AsyncIterator[str]:
+        assert delta is True  # production code always calls with delta=True
         for chunk in self._chunks:
             yield chunk
 
     async def get_output(self) -> str:
         return self._output
 
-    def all_messages(self):
+    def all_messages(self) -> list[ModelMessage]:
         return self._messages
 
 
@@ -256,12 +260,17 @@ class _FakeStreamCtx:
     async def __aenter__(self) -> _FakeStreamResult:
         return self._result
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         return None
 
 
 def _make_fake_stream(chunks: list[str], output: str) -> _FakeStreamCtx:
-    messages = [
+    messages: list[ModelMessage] = [
         ModelRequest(parts=[UserPromptPart(content="test prompt")]),
         ModelResponse(parts=[TextPart(content=output)]),
     ]
@@ -350,9 +359,15 @@ async def test_run_skill_streaming_disabled_creates_no_log(tmp_path: Path) -> No
 
         result = await server._run_skill(skill, "say hello")
 
+    # Verify the happy path completed
+    assert result["response"] == "Hello from the agent!"
+    assert "error" not in result
+
+    # No .log file created for this session, and none anywhere in session_dir
     store = server._get_session_store()
     log_path = store.log_path(result["session_id"])
     assert not log_path.exists()
+    assert list(store.session_dir.glob("*.log")) == []
 
 
 async def test_tail_session_log_tool_returns_bytes(tmp_path: Path) -> None:
