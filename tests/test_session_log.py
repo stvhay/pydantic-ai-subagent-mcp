@@ -76,3 +76,27 @@ def test_tail_handles_split_utf8_at_boundary(tmp_path: Path) -> None:
     # Must not raise. With errors="replace", the lone 0xc3 becomes "\ufffd" (replacement char).
     assert text.startswith("ab")
     assert len(text) == 3  # "ab" + replacement char
+
+
+def test_tail_offset_beyond_file_size(tmp_path: Path) -> None:
+    """Offset past end of file returns empty text and preserves the offset."""
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create("test-skill", "gemma4:12b")
+    log = store.log_path(session.session_id)
+    log.write_text("abc")  # 3 bytes
+
+    text, offset = store.tail(session.session_id, offset=100)
+    assert text == ""
+    assert offset == 100  # preserved, not reset
+
+
+def test_tail_empty_log_file_exists(tmp_path: Path) -> None:
+    """Empty log file (exists but zero bytes) returns empty text at offset 0."""
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create("test-skill", "gemma4:12b")
+    log = store.log_path(session.session_id)
+    log.write_bytes(b"")  # empty file that exists
+
+    text, offset = store.tail(session.session_id, offset=0)
+    assert text == ""
+    assert offset == 0
