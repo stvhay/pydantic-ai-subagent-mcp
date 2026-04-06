@@ -11,6 +11,7 @@ When loaded as an MCP server in Claude Code, it:
 3. **Delegates execution** to a pydantic-ai agent backed by Ollama, with a rich set of built-in tools (file I/O, code search, shell execution, srclight)
 4. **Manages sessions** with UUID-keyed transcripts so conversations can be resumed
 5. **Supports recursive sub-agents** -- the spawned agent can itself use this MCP to create sub-sub-agents
+6. **Streams output incrementally** — with `streaming: true` (default), each skill run writes text deltas to a `<session_id>.log` file alongside the session JSON. Use the `tail_session_log` tool to poll for live output while a run is in progress.
 
 ## Quick start
 
@@ -37,11 +38,12 @@ Create `.subagent-mcp.json` in your project root:
   "ollama_base_url": "http://localhost:11434",
   "default_model": "gemma4:12b",
   "session_dir": ".subagent-sessions",
+  "streaming": true,
   "srclight_enabled": true
 }
 ```
 
-Environment variables `OLLAMA_BASE_URL` and `SUBAGENT_MCP_DEFAULT_MODEL` override the config file.
+Environment variables `OLLAMA_BASE_URL`, `SUBAGENT_MCP_DEFAULT_MODEL`, and `SUBAGENT_MCP_STREAMING` override the config file.
 
 ## Development
 

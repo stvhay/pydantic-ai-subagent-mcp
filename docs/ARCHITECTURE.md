@@ -47,6 +47,16 @@ Claude Code (MCP client)
 > we chose `MCPServerStdio` toolsets to reuse the MCP protocol and enable the agent
 > to call any MCP server, accepting subprocess management overhead.
 
+### ADR-4: Log-based streaming over MCP progress notifications
+
+> In the context of wanting incremental output visibility during long-running
+> skill runs, facing a choice between MCP `notifications/progress` (requires
+> client-side `progressToken` handling) and writing deltas to per-session log
+> files, we chose the log-file approach to keep the MCP tool contract unchanged
+> (callers still receive a complete result) and to make transcripts inspectable
+> out-of-band, accepting that clients must poll a `tail_session_log` tool to
+> read live output.
+
 ## Component Responsibilities
 
 | Component | Responsibility |
@@ -54,5 +64,5 @@ Claude Code (MCP client)
 | `server.py` | FastMCP server, tool registration, agent orchestration |
 | `config.py` | Configuration from file + environment |
 | `skills.py` | Skill discovery from filesystem |
-| `session.py` | Session persistence with native pydantic-ai messages |
+| `session.py` | Session persistence with native pydantic-ai messages; per-session `.log` files for streaming output |
 | `tools.py` | Built-in tools for file I/O, search, shell |
