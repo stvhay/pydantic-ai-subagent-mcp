@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic_ai import Agent
+from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.ollama import OllamaProvider
 
@@ -100,7 +101,7 @@ async def _run_skill_streaming(
     prompt: str,
     session: Session,
     store: SessionStore,
-) -> tuple[str, list[Any]]:
+) -> tuple[str, list[ModelMessage]]:
     """Run the agent with streaming and write deltas to the session log.
 
     Opens ``{session_dir}/{session_id}.log`` in append mode, writes a
@@ -111,7 +112,6 @@ async def _run_skill_streaming(
     Returns ``(final_output, all_messages)``.
     """
     log_path = store.log_path(session.session_id)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
     header = (
         f"\n--- {datetime.now(UTC).isoformat()} prompt ---\n"
         f"{prompt}\n--- response ---\n"

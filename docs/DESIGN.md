@@ -24,7 +24,7 @@ tool interactions.
 ## Streaming
 
 Skill execution uses `agent.run_stream()` when `config.streaming` is true (the
-default). Text deltas from the model are appended to `{session_dir}/{uuid}.log`
+default). Text deltas from the model are appended to `{session_dir}/{session_id}.log`
 and flushed after each chunk, while the final complete response is returned
 from the MCP tool as before — the MCP protocol requires tool results to be
 complete, so streaming is a side-channel, not a change to the tool return
@@ -34,10 +34,12 @@ Each turn of a multi-turn session appends a new `--- prompt ---` /
 `--- response ---` block to the log, giving a plain-text transcript alongside
 the structured JSON session file.
 
-The `tail_session_log(session_id, offset)` tool reads bytes from a given
-offset and returns `(text, next_offset)`. Clients poll by feeding the returned
-`next_offset` back on the next call. Partial UTF-8 sequences at read
-boundaries are decoded with `errors="replace"`.
+Internally, `SessionStore.tail(session_id, offset)` returns a
+`(text, next_offset)` tuple. The `tail_session_log` MCP tool wraps that
+helper and returns a JSON envelope with `session_id`, `text`, and
+`next_offset` so callers can correlate polling results. Clients poll by
+feeding the returned `next_offset` back on the next call. Partial UTF-8
+sequences at read boundaries are decoded with `errors="replace"`.
 
 Setting `streaming: false` (config or `SUBAGENT_MCP_STREAMING=false`) falls
 back to `agent.run()` and no log file is written.
