@@ -4,5 +4,6 @@
   "session_dir": ".subagent-sessions",
   "max_iterations": 50,
   "tool_timeout": 120.0,
+  "streaming": true,
   "srclight_enabled": true
 }
