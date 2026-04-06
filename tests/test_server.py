@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
+from types import TracebackType
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic_ai.messages import (
+    ModelMessage,
     ModelRequest,
     ModelResponse,
     TextPart,
@@ -24,7 +27,11 @@ def _reset_server_globals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     """Reset server module globals between tests."""
     monkeypatch.delenv("SUBAGENT_MCP_DEFAULT_MODEL", raising=False)
     monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
-    server._config = ServerConfig(session_dir=str(tmp_path / "sessions"))
+    monkeypatch.delenv("SUBAGENT_MCP_STREAMING", raising=False)
+    server._config = ServerConfig(
+        session_dir=str(tmp_path / "sessions"),
+        streaming=False,
+    )
     server._session_store = None
     server._skills = []
 
@@ -219,3 +226,187 @@ async def test_check_ollama_failure_logs_warning() -> None:
         config = ServerConfig()
         # Should not raise
         await server._check_ollama(config)
+
+
+# -- Streaming tests --
+
+
+class _FakeStreamResult:
+    """Minimal fake for pydantic-ai's StreamedRunResult."""
+
+    def __init__(self, chunks: list[str], messages: list[ModelMessage]) -> None:
+        self._chunks = chunks
+        self._messages = messages
+        self._output = "".join(chunks)
+
+    async def stream_text(self, *, delta: bool = False) -> AsyncIterator[str]:
+        assert delta is True  # production code always calls with delta=True
+        for chunk in self._chunks:
+            yield chunk
+
+    async def get_output(self) -> str:
+        return self._output
+
+    def all_messages(self) -> list[ModelMessage]:
+        return self._messages
+
+
+class _FakeStreamCtx:
+    """Async context manager wrapper for _FakeStreamResult."""
+
+    def __init__(self, result: _FakeStreamResult) -> None:
+        self._result = result
+
+    async def __aenter__(self) -> _FakeStreamResult:
+        return self._result
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        return None
+
+
+def _make_fake_stream(chunks: list[str], output: str) -> _FakeStreamCtx:
+    messages: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content="test prompt")]),
+        ModelResponse(parts=[TextPart(content=output)]),
+    ]
+    return _FakeStreamCtx(_FakeStreamResult(chunks, messages))
+
+
+async def test_run_skill_streaming_writes_log(tmp_path: Path) -> None:
+    """With streaming=True, _run_skill writes deltas to the session log file."""
+    server._config = ServerConfig(
+        session_dir=str(tmp_path / "sessions"),
+        streaming=True,
+    )
+    server._session_store = None  # force rebuild with new config
+
+    skill = _make_skill(tmp_path)
+    chunks = ["Hello", " from", " the", " agent!"]
+    expected_output = "Hello from the agent!"
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = MagicMock()
+        mock_agent.run_stream = MagicMock(
+            return_value=_make_fake_stream(chunks, expected_output)
+        )
+        mock_build.return_value = mock_agent
+
+        result = await server._run_skill(skill, "say hello")
+
+    assert result["response"] == expected_output
+    assert result["skill"] == "test-skill"
+    assert "error" not in result
+
+    store = server._get_session_store()
+    log_path = store.log_path(result["session_id"])
+    assert log_path.exists()
+    log_text = log_path.read_text()
+    assert expected_output in log_text
+    assert "--- response ---" in log_text
+    assert "say hello" in log_text
+
+
+async def test_run_skill_streaming_multi_turn_appends(tmp_path: Path) -> None:
+    """Each turn appends a new prompt/response block to the same log."""
+    server._config = ServerConfig(
+        session_dir=str(tmp_path / "sessions"),
+        streaming=True,
+    )
+    server._session_store = None
+
+    skill = _make_skill(tmp_path)
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = MagicMock()
+        mock_agent.run_stream = MagicMock(
+            side_effect=[
+                _make_fake_stream(["Response", " one"], "Response one"),
+                _make_fake_stream(["Response", " two"], "Response two"),
+            ]
+        )
+        mock_build.return_value = mock_agent
+
+        result1 = await server._run_skill(skill, "first")
+        session_id = result1["session_id"]
+        result2 = await server._run_skill(skill, "second", session_id=session_id)
+
+    assert result2["session_id"] == session_id
+
+    store = server._get_session_store()
+    log_text = store.log_path(session_id).read_text()
+    assert log_text.count("--- response ---") == 2
+    assert "first" in log_text
+    assert "second" in log_text
+    assert "Response one" in log_text
+    assert "Response two" in log_text
+
+
+async def test_run_skill_streaming_disabled_creates_no_log(tmp_path: Path) -> None:
+    """With streaming=False, no .log file is created."""
+    # Fixture already sets streaming=False
+    skill = _make_skill(tmp_path)
+    mock_result = _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=mock_result)
+        mock_build.return_value = mock_agent
+
+        result = await server._run_skill(skill, "say hello")
+
+    # Verify the happy path completed
+    assert result["response"] == "Hello from the agent!"
+    assert "error" not in result
+
+    # No .log file created for this session, and none anywhere in session_dir
+    store = server._get_session_store()
+    log_path = store.log_path(result["session_id"])
+    assert not log_path.exists()
+    assert list(store.session_dir.glob("*.log")) == []
+
+
+async def test_tail_session_log_tool_returns_bytes(tmp_path: Path) -> None:
+    """tail_session_log tool reads from the session log at a given offset."""
+    store = server._get_session_store()
+    session = store.create("test-skill", "gemma4:12b")
+    log = store.log_path(session.session_id)
+    log.write_text("hello world")
+
+    result_json = await server.tail_session_log(session.session_id, offset=0)
+    result = json.loads(result_json)
+    assert result["session_id"] == session.session_id
+    assert result["text"] == "hello world"
+    assert result["next_offset"] == len("hello world")
+
+
+async def test_tail_session_log_tool_incremental(tmp_path: Path) -> None:
+    """Feeding next_offset back returns only the newly appended content."""
+    store = server._get_session_store()
+    session = store.create("test-skill", "gemma4:12b")
+    log = store.log_path(session.session_id)
+    log.write_text("first")
+
+    first = json.loads(await server.tail_session_log(session.session_id, offset=0))
+    assert first["text"] == "first"
+    assert first["next_offset"] == 5
+
+    with log.open("a") as f:
+        f.write(" second")
+
+    second = json.loads(
+        await server.tail_session_log(session.session_id, offset=first["next_offset"])
+    )
+    assert second["text"] == " second"
+
+
+async def test_tail_session_log_tool_nonexistent() -> None:
+    """Tailing a nonexistent session returns empty text and offset 0."""
+    result_json = await server.tail_session_log("nonexistent-uuid", offset=0)
+    result = json.loads(result_json)
+    assert result["text"] == ""
+    assert result["next_offset"] == 0

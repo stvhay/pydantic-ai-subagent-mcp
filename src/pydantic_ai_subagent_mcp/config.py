@@ -19,6 +19,7 @@ class ServerConfig:
     max_iterations: int = 50
     tool_timeout: float = 120.0
     srclight_enabled: bool = True
+    streaming: bool = True
     extra_env: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -31,6 +32,12 @@ class ServerConfig:
             config_path = Path(".subagent-mcp.json")
         if config_path.exists():
             data = json.loads(config_path.read_text())
+
+        # Parse SUBAGENT_MCP_STREAMING env override (truthy: 1/true/yes)
+        streaming_default = bool(data.get("streaming", cls.streaming))
+        streaming_env = os.environ.get("SUBAGENT_MCP_STREAMING")
+        if streaming_env is not None:
+            streaming_default = streaming_env.strip().lower() in ("1", "true", "yes")
 
         # Environment overrides take precedence
         return cls(
@@ -45,5 +52,6 @@ class ServerConfig:
             max_iterations=int(data.get("max_iterations", cls.max_iterations)),
             tool_timeout=float(data.get("tool_timeout", cls.tool_timeout)),
             srclight_enabled=data.get("srclight_enabled", cls.srclight_enabled),
+            streaming=streaming_default,
             extra_env=data.get("extra_env", {}),
         )

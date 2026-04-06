@@ -7,6 +7,7 @@ import logging
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -16,7 +17,7 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.ollama import OllamaProvider
 
 from .config import ServerConfig
-from .session import SessionStore
+from .session import Session, SessionStore
 from .skills import Skill, discover_skills
 from .tools import BUILTIN_TOOLS
 
@@ -94,6 +95,42 @@ def _build_agent(skill: Skill, model_name: str | None = None) -> Agent[None, str
     )
 
 
+async def _run_skill_streaming(
+    agent: Agent[None, str],
+    prompt: str,
+    session: Session,
+    store: SessionStore,
+) -> tuple[str, list[Any]]:
+    """Run the agent with streaming and write deltas to the session log.
+
+    Opens ``{session_dir}/{session_id}.log`` in append mode, writes a
+    timestamped ``--- prompt ---`` / ``--- response ---`` header block,
+    then streams text deltas from ``agent.run_stream()`` to the file with
+    per-chunk flush so concurrent tail readers see output in real time.
+
+    Returns ``(final_output, all_messages)``.
+    """
+    log_path = store.log_path(session.session_id)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    header = (
+        f"\n--- {datetime.now(UTC).isoformat()} prompt ---\n"
+        f"{prompt}\n--- response ---\n"
+    )
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(header)
+        log.flush()
+        async with agent.run_stream(
+            prompt,
+            message_history=session.messages or None,
+        ) as result:
+            async for chunk in result.stream_text(delta=True):
+                log.write(chunk)
+                log.flush()
+            output = await result.get_output()
+            messages = result.all_messages()
+    return output, messages
+
+
 async def _run_skill(
     skill: Skill,
     prompt: str,
@@ -102,29 +139,37 @@ async def _run_skill(
 ) -> dict[str, Any]:
     """Execute a skill with the subagent and return results."""
     store = _get_session_store()
+    config = _get_config()
 
     # Resume or create session
     session = None
     if session_id:
         session = store.get(session_id)
     if session is None:
-        effective_model = model or _get_config().default_model
+        effective_model = model or config.default_model
         session = store.create(skill.name, effective_model)
 
     agent = _build_agent(skill, model or session.model)
 
     try:
-        result = await agent.run(
-            prompt,
-            message_history=session.messages or None,
-        )
+        if config.streaming:
+            output, messages = await _run_skill_streaming(
+                agent, prompt, session, store
+            )
+        else:
+            result = await agent.run(
+                prompt,
+                message_history=session.messages or None,
+            )
+            output = result.output
+            messages = result.all_messages()
 
-        session.messages = result.all_messages()
+        session.messages = messages
         store.save(session)
 
         return {
             "session_id": session.session_id,
-            "response": result.output,
+            "response": output,
             "model": session.model,
             "skill": skill.name,
         }
@@ -191,6 +236,25 @@ async def get_session_transcript(session_id: str) -> str:
 )
 async def list_available_skills() -> str:
     return json.dumps([s.to_dict() for s in _skills], indent=2)
+
+
+@mcp_server.tool(
+    name="tail_session_log",
+    description=(
+        "Read new output from a running (or completed) session log. "
+        "Pass offset=0 for the first call, then feed back the returned "
+        "next_offset to poll for new content. Returns JSON with "
+        "session_id, text, and next_offset."
+    ),
+)
+async def tail_session_log(session_id: str, offset: int = 0) -> str:
+    store = _get_session_store()
+    text, next_offset = store.tail(session_id, offset=offset)
+    return json.dumps({
+        "session_id": session_id,
+        "text": text,
+        "next_offset": next_offset,
+    })
 
 
 @mcp_server.tool(
