@@ -58,6 +58,14 @@ helper and returns a JSON envelope with `session_id`, `text`, and
 feeding the returned `next_offset` back on the next call. Partial UTF-8
 sequences at read boundaries are decoded with `errors="replace"`.
 
+During an active streaming run, `get_session_transcript` reflects the
+session as last persisted to disk — the in-flight turn is not yet visible
+because pydantic-ai's `all_messages()` is unavailable until the
+`agent.run_stream()` context exits. Use `tail_session_log(session_id, offset)`
+to observe the in-progress response as deltas are flushed; once the stream
+completes (trailer line written, session saved) `get_session_transcript`
+returns the full structured history.
+
 Setting `streaming: false` (config or `SUBAGENT_MCP_STREAMING=false`) falls
 back to `agent.run()` and no log file is written.
 
