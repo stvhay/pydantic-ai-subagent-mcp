@@ -45,11 +45,11 @@ MCP tool caller receives the usual error-dict response. On cancellation
 `--- end cancelled {iso_ts}: {ExceptionType}: {message} ---` and the
 exception still propagates out of `_run_skill` — the outer handler only
 catches `Exception`, so cancellation reaches the MCP runtime intact. Tail
-clients should detect the end of a turn by matching `^--- end (ok|error|
-cancelled) ` at the start of a line. Trailer writes are best-effort: if
-writing the trailer itself fails the failure is logged but the caller's
-exception is never masked. Newlines in exception messages are replaced with
-spaces so trailers are always single lines.
+clients should detect the end of a turn by matching the regex
+`^--- end (ok|error|cancelled) ` at the start of a line. Trailer writes are
+best-effort: if writing the trailer itself fails the failure is logged but
+the caller's exception is never masked. Newlines in exception messages are
+replaced with spaces so trailers are always single lines.
 
 Internally, `SessionStore.tail(session_id, offset)` returns a
 `(text, next_offset)` tuple. The `tail_session_log` MCP tool wraps that
