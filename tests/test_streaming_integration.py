@@ -96,6 +96,7 @@ async def test_streaming_against_real_ollama_writes_log(tmp_path: Path) -> None:
     # Header is "--- {iso_ts} prompt ---\n"; response marker has no timestamp.
     assert "prompt ---\n" in content
     assert "--- response ---\n" in content
+    assert "--- end ok " in content  # trailer present on success
     assert "Say hello." in content
 
     # Everything after the response marker should be non-empty — it's the
@@ -127,5 +128,6 @@ async def test_streaming_against_real_ollama_multi_turn_appends(
     # Header is "--- {iso_ts} prompt ---\n"; response marker has no timestamp.
     assert content.count("prompt ---\n") == 2
     assert content.count("--- response ---\n") == 2
+    assert content.count("--- end ok ") == 2  # one trailer per turn
     assert "Say 'one'." in content
     assert "Say 'two'." in content
