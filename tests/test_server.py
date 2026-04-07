@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -280,7 +281,9 @@ def _make_fake_stream(chunks: list[str], output: str) -> _FakeStreamCtx:
 class _FailingStreamResult:
     """Fake StreamedRunResult whose stream_text raises mid-iteration."""
 
-    def __init__(self, chunks_before_error: list[str], exc: Exception) -> None:
+    def __init__(
+        self, chunks_before_error: list[str], exc: BaseException
+    ) -> None:
         self._chunks = chunks_before_error
         self._exc = exc
 
@@ -297,7 +300,9 @@ class _FailingStreamResult:
         raise AssertionError("all_messages should not be called after failure")
 
 
-def _make_failing_stream(chunks_before: list[str], exc: Exception) -> _FakeStreamCtx:
+def _make_failing_stream(
+    chunks_before: list[str], exc: BaseException
+) -> _FakeStreamCtx:
     return _FakeStreamCtx(_FailingStreamResult(chunks_before, exc))  # type: ignore[arg-type]
 
 
@@ -505,6 +510,52 @@ async def test_run_skill_streaming_error_trailer_sanitizes_newlines(
     assert "\n" not in trailer_line
     assert "\r" not in trailer_line
     assert "line one line two line three" in trailer_line
+
+
+async def test_run_skill_streaming_cancelled_writes_cancelled_trailer(
+    tmp_path: Path,
+) -> None:
+    """A cancelled stream writes an `--- end cancelled ---` trailer.
+
+    Tests issue #8 follow-up: CancelledError is BaseException, not Exception,
+    so it propagates past _run_skill's outer error handler. The trailer must
+    still be written before the exception escapes _run_skill_streaming.
+    """
+    server._config = ServerConfig(
+        session_dir=str(tmp_path / "sessions"),
+        streaming=True,
+    )
+    server._session_store = None
+
+    skill = _make_skill(tmp_path)
+    cancelled = asyncio.CancelledError()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = MagicMock()
+        mock_agent.run_stream = MagicMock(
+            return_value=_make_failing_stream(["partial"], cancelled)
+        )
+        mock_build.return_value = mock_agent
+
+        # CancelledError is BaseException, so it propagates past _run_skill's
+        # `except Exception` and out of _run_skill entirely.
+        with pytest.raises(asyncio.CancelledError):
+            await server._run_skill(skill, "trigger cancellation")
+
+    # Find the log file (we don't have a session_id from a returned dict)
+    log_files = list((tmp_path / "sessions").glob("*.log"))
+    assert len(log_files) == 1, f"expected exactly one log file, got {log_files}"
+    log_text = log_files[0].read_text()
+
+    assert "partial" in log_text  # the chunk before cancellation was flushed
+    last_line = log_text.rstrip("\n").rsplit("\n", 1)[-1]
+    assert last_line.startswith("--- end cancelled "), (
+        f"unexpected last line: {last_line!r}"
+    )
+    assert "CancelledError" in last_line
+    assert last_line.endswith(" ---"), f"unexpected last line: {last_line!r}"
+    assert "--- end ok " not in log_text
+    assert "--- end error " not in log_text
 
 
 async def test_tail_session_log_tool_returns_bytes(tmp_path: Path) -> None:
