@@ -277,6 +277,30 @@ def _make_fake_stream(chunks: list[str], output: str) -> _FakeStreamCtx:
     return _FakeStreamCtx(_FakeStreamResult(chunks, messages))
 
 
+class _FailingStreamResult:
+    """Fake StreamedRunResult whose stream_text raises mid-iteration."""
+
+    def __init__(self, chunks_before_error: list[str], exc: Exception) -> None:
+        self._chunks = chunks_before_error
+        self._exc = exc
+
+    async def stream_text(self, *, delta: bool = False) -> AsyncIterator[str]:
+        assert delta is True
+        for chunk in self._chunks:
+            yield chunk
+        raise self._exc
+
+    async def get_output(self) -> str:  # pragma: no cover — never reached
+        raise AssertionError("get_output should not be called after failure")
+
+    def all_messages(self) -> list[ModelMessage]:  # pragma: no cover
+        raise AssertionError("all_messages should not be called after failure")
+
+
+def _make_failing_stream(chunks_before: list[str], exc: Exception) -> _FakeStreamCtx:
+    return _FakeStreamCtx(_FailingStreamResult(chunks_before, exc))  # type: ignore[arg-type]
+
+
 async def test_run_skill_streaming_writes_log(tmp_path: Path) -> None:
     """With streaming=True, _run_skill writes deltas to the session log file."""
     server._config = ServerConfig(
@@ -309,6 +333,7 @@ async def test_run_skill_streaming_writes_log(tmp_path: Path) -> None:
     assert expected_output in log_text
     assert "--- response ---" in log_text
     assert "say hello" in log_text
+    assert "--- end ok " in log_text  # trailer present on success
 
 
 async def test_run_skill_streaming_multi_turn_appends(tmp_path: Path) -> None:
@@ -340,6 +365,7 @@ async def test_run_skill_streaming_multi_turn_appends(tmp_path: Path) -> None:
     store = server._get_session_store()
     log_text = store.log_path(session_id).read_text()
     assert log_text.count("--- response ---") == 2
+    assert log_text.count("--- end ok ") == 2  # one trailer per turn
     assert "first" in log_text
     assert "second" in log_text
     assert "Response one" in log_text
@@ -368,6 +394,117 @@ async def test_run_skill_streaming_disabled_creates_no_log(tmp_path: Path) -> No
     log_path = store.log_path(result["session_id"])
     assert not log_path.exists()
     assert list(store.session_dir.glob("*.log")) == []
+
+
+async def test_run_skill_streaming_writes_ok_trailer(tmp_path: Path) -> None:
+    """Successful streaming writes `--- end ok {ts} ---` trailer as final line.
+
+    Tests issue #8 acceptance criterion 1.
+    """
+    server._config = ServerConfig(
+        session_dir=str(tmp_path / "sessions"),
+        streaming=True,
+    )
+    server._session_store = None  # force rebuild with new config
+
+    skill = _make_skill(tmp_path)
+    chunks = ["Hello", " world"]
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = MagicMock()
+        mock_agent.run_stream = MagicMock(
+            return_value=_make_fake_stream(chunks, "Hello world")
+        )
+        mock_build.return_value = mock_agent
+
+        result = await server._run_skill(skill, "say hi")
+
+    assert "error" not in result
+    log_text = server._get_session_store().log_path(result["session_id"]).read_text()
+
+    # Trailer is the last non-empty line of the log
+    last_line = log_text.rstrip("\n").rsplit("\n", 1)[-1]
+    assert last_line.startswith("--- end ok "), f"unexpected last line: {last_line!r}"
+    assert last_line.endswith(" ---"), f"unexpected last line: {last_line!r}"
+    assert "--- end error " not in log_text
+
+
+async def test_run_skill_streaming_writes_error_trailer_and_propagates(
+    tmp_path: Path,
+) -> None:
+    """A mid-stream exception is recorded in an error trailer.
+
+    The exception surfaces via _run_skill's error response.
+    Tests issue #8 acceptance criterion 2.
+    """
+    server._config = ServerConfig(
+        session_dir=str(tmp_path / "sessions"),
+        streaming=True,
+    )
+    server._session_store = None
+
+    skill = _make_skill(tmp_path)
+    boom = RuntimeError("ollama vanished")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = MagicMock()
+        mock_agent.run_stream = MagicMock(
+            return_value=_make_failing_stream(["partial"], boom)
+        )
+        mock_build.return_value = mock_agent
+
+        # Outer _run_skill catches the re-raised exception and returns an
+        # error dict — we get the error response, not an exception out of _run_skill.
+        result = await server._run_skill(skill, "trigger failure")
+
+    assert "error" in result
+    assert "ollama vanished" in result["error"]
+
+    log_text = server._get_session_store().log_path(result["session_id"]).read_text()
+    assert "partial" in log_text  # the chunk before the failure was flushed
+    last_line = log_text.rstrip("\n").rsplit("\n", 1)[-1]
+    assert last_line.startswith("--- end error "), f"unexpected last line: {last_line!r}"
+    assert "RuntimeError: ollama vanished" in last_line
+    assert last_line.endswith(" ---"), f"unexpected last line: {last_line!r}"
+    assert "--- end ok " not in log_text
+
+
+async def test_run_skill_streaming_error_trailer_sanitizes_newlines(
+    tmp_path: Path,
+) -> None:
+    """Newlines and carriage returns in exception messages are replaced.
+
+    Ensures the trailer stays on a single line.
+    """
+    server._config = ServerConfig(
+        session_dir=str(tmp_path / "sessions"),
+        streaming=True,
+    )
+    server._session_store = None
+
+    skill = _make_skill(tmp_path)
+    boom = ValueError("line one\nline two\rline three")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = MagicMock()
+        mock_agent.run_stream = MagicMock(
+            return_value=_make_failing_stream([], boom)
+        )
+        mock_build.return_value = mock_agent
+
+        await server._run_skill(skill, "go")
+
+    log_files = list((tmp_path / "sessions").glob("*.log"))
+    assert len(log_files) == 1, f"expected exactly one log file, got {log_files}"
+    log_text = log_files[0].read_text()
+
+    trailer_line = next(
+        line for line in log_text.splitlines() if line.startswith("--- end error ")
+    )
+    # splitlines() already guarantees no \n in the line, but be explicit:
+    assert "\n" not in trailer_line
+    assert "\r" not in trailer_line
+    assert "line one line two line three" in trailer_line
 
 
 async def test_tail_session_log_tool_returns_bytes(tmp_path: Path) -> None:

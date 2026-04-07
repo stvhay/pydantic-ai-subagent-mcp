@@ -34,6 +34,8 @@ Each turn of a multi-turn session appends a new `--- prompt ---` /
 `--- response ---` block to the log, giving a plain-text transcript alongside
 the structured JSON session file.
 
+Each turn is terminated by a trailer line so tail clients can detect completion. On success, the log gains a `--- end ok {iso_ts} ---` line; on failure (any exception escaping `agent.run_stream()` or `stream_text()`), the log gains a `--- end error {iso_ts}: {ExceptionType}: {message} ---` line and the original exception still propagates to the outer `_run_skill` handler so the MCP tool caller receives the usual error-dict response. Tail clients should detect the end of a turn by matching `^--- end (ok|error) ` at the start of a line; the `ok`/`error` word distinguishes successful completion from a stream that aborted partway through. Newlines in exception messages are replaced with spaces so the trailer is always a single line.
+
 Internally, `SessionStore.tail(session_id, offset)` returns a
 `(text, next_offset)` tuple. The `tail_session_log` MCP tool wraps that
 helper and returns a JSON envelope with `session_id`, `text`, and

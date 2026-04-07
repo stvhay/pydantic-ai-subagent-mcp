@@ -109,6 +109,12 @@ async def _run_skill_streaming(
     then streams text deltas from ``agent.run_stream()`` to the file with
     per-chunk flush so concurrent tail readers see output in real time.
 
+    Each turn is terminated by a trailer line so tail clients can detect
+    completion: ``--- end ok {iso_ts} ---`` on success, or
+    ``--- end error {iso_ts}: {ExceptionType}: {message} ---`` on failure.
+    Exceptions are re-raised after the trailer is written so the outer
+    ``_run_skill`` error handler still produces the MCP error response.
+
     Returns ``(final_output, all_messages)``.
     """
     log_path = store.log_path(session.session_id)
@@ -119,15 +125,27 @@ async def _run_skill_streaming(
     with log_path.open("a", encoding="utf-8") as log:
         log.write(header)
         log.flush()
-        async with agent.run_stream(
-            prompt,
-            message_history=session.messages or None,
-        ) as result:
-            async for chunk in result.stream_text(delta=True):
-                log.write(chunk)
-                log.flush()
-            output = await result.get_output()
-            messages = result.all_messages()
+        try:
+            async with agent.run_stream(
+                prompt,
+                message_history=session.messages or None,
+            ) as result:
+                async for chunk in result.stream_text(delta=True):
+                    log.write(chunk)
+                    log.flush()
+                output = await result.get_output()
+                messages = result.all_messages()
+        except Exception as e:
+            detail = str(e).replace("\n", " ").replace("\r", " ")
+            log.write(
+                f"\n--- end error {datetime.now(UTC).isoformat()}: "
+                f"{type(e).__name__}: {detail} ---\n"
+            )
+            log.flush()
+            raise
+        else:
+            log.write(f"\n--- end ok {datetime.now(UTC).isoformat()} ---\n")
+            log.flush()
     return output, messages
 
 
