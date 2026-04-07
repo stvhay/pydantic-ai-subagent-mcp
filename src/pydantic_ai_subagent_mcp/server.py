@@ -279,8 +279,8 @@ async def list_sessions() -> str:
     description=(
         "Get the full structured transcript of a session by its UUID. "
         "During an active streaming run the in-flight turn is not yet visible "
-        "(pydantic-ai's all_messages() is unavailable until the stream completes) "
-        "— use tail_session_log to observe in-progress output."
+        "(the session is only persisted after the stream completes) "
+        "-- use tail_session_log to observe in-progress output."
     ),
 )
 async def get_session_transcript(session_id: str) -> str:
@@ -302,11 +302,12 @@ async def list_available_skills() -> str:
 @mcp_server.tool(
     name="tail_session_log",
     description=(
-        "Read new output from a running (or completed) session log as plain text. "
+        "Read new output from a running (or completed) session log. "
         "Pass offset=0 for the first call, then feed back the returned "
         "next_offset to poll for new content. Returns JSON with "
-        "session_id, text, and next_offset. For the structured pydantic-ai "
-        "message history of completed turns, use get_session_transcript."
+        "session_id, text (raw stream output), and next_offset. For the "
+        "structured pydantic-ai message history of completed turns, use "
+        "get_session_transcript."
     ),
 )
 async def tail_session_log(session_id: str, offset: int = 0) -> str:

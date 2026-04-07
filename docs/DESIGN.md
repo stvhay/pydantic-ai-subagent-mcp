@@ -60,8 +60,9 @@ sequences at read boundaries are decoded with `errors="replace"`.
 
 During an active streaming run, `get_session_transcript` reflects the
 session as last persisted to disk — the in-flight turn is not yet visible
-because pydantic-ai's `all_messages()` is unavailable until the
-`agent.run_stream()` context exits. Use `tail_session_log(session_id, offset)`
+because `session.messages` is only written and `store.save(session)` is
+only called after the streaming turn fully completes and control returns
+from `_run_skill_streaming`. Use `tail_session_log(session_id, offset)`
 to observe the in-progress response as deltas are flushed; once the stream
 completes (trailer line written, session saved) `get_session_transcript`
 returns the full structured history.
