@@ -1,24 +1,24 @@
-name: Release
+name: Release PR
 
 on:
   push:
     branches: [main]
 
 concurrency:
-  group: version-bump
+  group: release-pr
   cancel-in-progress: false
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
-  release:
+  release-pr:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-python@v5
         with:
@@ -41,27 +41,32 @@ jobs:
           python compute_version.py --ci --update
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Commit version bump
+      # The token below prefers `RELEASE_PAT` over `GITHUB_TOKEN`.
+      # PRs opened with the default `GITHUB_TOKEN` cannot trigger downstream
+      # workflows (GitHub's anti-recursion rule), which means CI's `test`
+      # status check would not run on the release PR and it could never be
+      # merged on a protected branch. Set a `RELEASE_PAT` repository secret
+      # (a fine-grained PAT with `contents: write` and `pull-requests: write`
+      # on this repo) to enable full automation. Without it, the PR is still
+      # opened, but you must close-and-reopen it (or push an empty commit) to
+      # trigger CI before merging.
+      - name: Open release PR
         if: steps.check.outputs.has_unreleased == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "release: v${{ steps.version.outputs.version }}"
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+          commit-message: "release: v${{ steps.version.outputs.version }}"
+          title: "release: v${{ steps.version.outputs.version }}"
+          body: |
+            Automated release PR for **v${{ steps.version.outputs.version }}**.
 
-      - name: Create tag
-        if: steps.check.outputs.has_unreleased == 'true'
-        run: |
-          TAG="$(date -u +%Y-%m-%dT%H%M%SZ)"
-          git tag "$TAG"
-          git push origin main --tags
+            This PR was opened by the `Release PR` workflow because `CHANGELOG.md`
+            contained an `## Unreleased` section. It bumps the version in
+            `pyproject.toml`, `src/pydantic_ai_subagent_mcp/__init__.py`, and
+            rewrites the changelog header.
 
-      - name: Create GitHub Release
-        if: steps.check.outputs.has_unreleased == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="$(git describe --tags --abbrev=0)"
-          gh release create "$TAG" \
-            --title "v${{ steps.version.outputs.version }}" \
-            --notes "See [CHANGELOG.md](CHANGELOG.md) for details."
+            **Merging this PR** will trigger the `Tag and Release` workflow,
+            which creates the git tag and GitHub release.
+          branch: "release/v${{ steps.version.outputs.version }}"
+          delete-branch: true
+          labels: release

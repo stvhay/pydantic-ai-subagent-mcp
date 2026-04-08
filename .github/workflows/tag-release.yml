@@ -1,0 +1,54 @@
+name: Tag and Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+concurrency:
+  group: tag-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  tag-release:
+    if: github.event.pull_request.merged == true && contains(github.event.pull_request.labels.*.name, 'release')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Read version from pyproject.toml
+        id: version
+        run: |
+          VERSION=$(python -c 'import re,sys; m=re.search(r"^version\s*=\s*\"([^\"]+)\"", open("pyproject.toml").read(), re.M); sys.stdout.write(m.group(1))')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          TAG="$(date -u +%Y-%m-%dT%H%M%SZ)"
+          git tag "$TAG" -m "Release v${VERSION}"
+          git push origin "$TAG"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "$TAG" \
+            --title "v${VERSION}" \
+            --notes "See [CHANGELOG.md](CHANGELOG.md) for details."
