@@ -90,7 +90,7 @@ Call the `stop_session` MCP tool with a `session_id` to cancel an in-flight turn
 
 Two independent caps protect the server from runaway producers:
 
-- **`max_concurrent_runs`** (default `4`) — server-wide ceiling on the number of in-flight skill turns across all sessions. Background launches that arrive while the gate is fully held return `status: "saturated"` immediately so the caller can react. Foreground launches always enqueue and end up waiting on the gate inside the worker (the natural Ask-mode behavior).
+- **`max_concurrent_runs`** (default `4`) — server-wide ceiling on the number of in-flight skill turns across all sessions. Both foreground and background launches always enqueue onto the session mailbox; the wait on the server-wide gate happens inside the worker, at the point of turn execution. When the gate is fully held, callers simply wait longer — there is no admission-time rejection (which would be inherently racy against the execution-time acquire).
 - **`mailbox_max_depth`** (default `16`) — per-session ceiling on queued items waiting behind the in-flight turn. A push that would exceed the cap returns `status: "mailbox_full"` regardless of mode, so foreground callers cannot bypass the cap by simply omitting `run_in_background`.
 
 Both knobs can be set in `.subagent-mcp.json` or overridden by `SUBAGENT_MCP_MAX_CONCURRENT_RUNS` and `SUBAGENT_MCP_MAILBOX_MAX_DEPTH`. Non-positive or unparseable values silently fall back to the defaults (a misconfigured backpressure knob must never crash the server at boot).

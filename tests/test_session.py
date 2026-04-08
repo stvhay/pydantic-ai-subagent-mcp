@@ -108,81 +108,7 @@ def test_session_disk_format_uses_type_adapter(tmp_path: Path) -> None:
     assert isinstance(restored[0], ModelRequest)
 
 
-# -- Phase 1: per-session locks + atomic persistence --
-
-
-async def test_per_session_lock_serializes_concurrent_holders(
-    tmp_path: Path,
-) -> None:
-    """Two coroutines holding the same session lock must run sequentially.
-
-    Verifies the linearizability invariant required by Phase 1: when two
-    callers race on the same session_id, one must fully complete its
-    critical section before the other starts.
-    """
-    store = SessionStore(tmp_path / "sessions")
-    session = store.create("skill", "gemma4:12b")
-
-    order: list[str] = []
-
-    async def critical_section(label: str) -> None:
-        async with store.lock(session.session_id):
-            order.append(f"start-{label}")
-            # Force a context switch while holding the lock; if the lock
-            # is broken, the other coroutine will interleave here.
-            await asyncio.sleep(0.01)
-            order.append(f"end-{label}")
-
-    await asyncio.gather(critical_section("a"), critical_section("b"))
-
-    # Whichever ran first must have fully completed before the other started.
-    assert order in (
-        ["start-a", "end-a", "start-b", "end-b"],
-        ["start-b", "end-b", "start-a", "end-a"],
-    )
-
-
-async def test_per_session_locks_are_independent(tmp_path: Path) -> None:
-    """Locks for distinct session_ids must not block each other."""
-    store = SessionStore(tmp_path / "sessions")
-    s1 = store.create("skill", "gemma4:12b")
-    s2 = store.create("skill", "gemma4:12b")
-
-    s1_holding = asyncio.Event()
-    s1_can_release = asyncio.Event()
-    s2_acquired = asyncio.Event()
-
-    async def hold_s1() -> None:
-        async with store.lock(s1.session_id):
-            s1_holding.set()
-            await s1_can_release.wait()
-
-    async def acquire_s2() -> None:
-        await s1_holding.wait()
-        async with store.lock(s2.session_id):
-            s2_acquired.set()
-
-    t1 = asyncio.create_task(hold_s1())
-    t2 = asyncio.create_task(acquire_s2())
-
-    # s2 must be acquirable while s1 is held; if locks were global this
-    # would deadlock and time out.
-    await asyncio.wait_for(s2_acquired.wait(), timeout=1.0)
-
-    s1_can_release.set()
-    await asyncio.gather(t1, t2)
-
-
-async def test_lock_returns_same_instance_per_session(tmp_path: Path) -> None:
-    """The lock for a given session_id must be the same Lock object on
-    repeated access — otherwise concurrent callers would each get their
-    own lock and the serialization guarantee would be lost."""
-    store = SessionStore(tmp_path / "sessions")
-    session = store.create("skill", "gemma4:12b")
-
-    lock_a = store._get_lock(session.session_id)
-    lock_b = store._get_lock(session.session_id)
-    assert lock_a is lock_b
+# -- Phase 1: atomic persistence --
 
 
 def test_atomic_persist_leaves_no_tempfiles_on_success(tmp_path: Path) -> None:
@@ -416,14 +342,15 @@ async def test_shutdown_cancels_workers_and_clears_registry(
     session = store.create("skill", "gemma4:12b")
     mb = store.get_or_create_mailbox(session.session_id)
 
-    # Worker blocks forever on an empty mailbox
+    worker_entered = asyncio.Event()
+
     async def worker() -> None:
+        worker_entered.set()
         await mb.get()
 
     task = asyncio.create_task(worker())
     store.register_worker(session.session_id, task)
-    # Yield once so the worker actually starts and reaches the await
-    await asyncio.sleep(0)
+    await worker_entered.wait()
     assert store.has_worker(session.session_id) is True
 
     await store.shutdown()
@@ -475,12 +402,15 @@ async def test_stop_session_cancels_idle_worker(tmp_path: Path) -> None:
     session = store.create("skill", "gemma4:12b")
     mb = store.get_or_create_mailbox(session.session_id)
 
+    entered = asyncio.Event()
+
     async def worker() -> None:
+        entered.set()
         await mb.get()  # blocks forever -- the test stops it
 
     task = asyncio.create_task(worker())
     store.register_worker(session.session_id, task)
-    await asyncio.sleep(0)  # let the worker reach its await
+    await entered.wait()
 
     result = await store.stop_session(session.session_id)
 
@@ -516,12 +446,15 @@ async def test_stop_session_drains_queued_items_and_calls_on_drop(
         await mb.put(item)
 
     # A worker that just blocks forever -- it will never drain
+    entered = asyncio.Event()
+
     async def worker() -> None:
+        entered.set()
         await asyncio.Event().wait()
 
     task = asyncio.create_task(worker())
     store.register_worker(session.session_id, task)
-    await asyncio.sleep(0)
+    await entered.wait()
 
     dropped: list[Any] = []
     result = await store.stop_session(
@@ -542,12 +475,15 @@ async def test_stop_session_is_idempotent(tmp_path: Path) -> None:
     session = store.create("skill", "gemma4:12b")
     mb = store.get_or_create_mailbox(session.session_id)
 
+    entered = asyncio.Event()
+
     async def worker() -> None:
+        entered.set()
         await mb.get()
 
     task = asyncio.create_task(worker())
     store.register_worker(session.session_id, task)
-    await asyncio.sleep(0)
+    await entered.wait()
 
     first = await store.stop_session(session.session_id)
     assert first["status"] == "stopped"
@@ -572,12 +508,15 @@ async def test_stop_session_on_drop_swallows_exceptions(tmp_path: Path) -> None:
     await mb.put("first")
     await mb.put("second")
 
+    entered = asyncio.Event()
+
     async def worker() -> None:
+        entered.set()
         await asyncio.Event().wait()
 
     task = asyncio.create_task(worker())
     store.register_worker(session.session_id, task)
-    await asyncio.sleep(0)
+    await entered.wait()
 
     def boom(_item: Any) -> None:
         raise RuntimeError("on_drop is broken")

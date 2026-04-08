@@ -22,6 +22,7 @@ from pydantic_ai.messages import (
 from pydantic_ai_subagent_mcp import server
 from pydantic_ai_subagent_mcp.config import ServerConfig
 from pydantic_ai_subagent_mcp.skills import Skill
+from tests._helpers import yield_until
 
 
 @pytest.fixture(autouse=True)
@@ -49,10 +50,6 @@ async def _reset_server_globals(
     server._session_store = None
     server._inbox = None
     server._skills = []
-    # Force the run semaphore to rebuild against the test's event loop.
-    # asyncio.Semaphore binds to the loop it was created on, so a stale
-    # semaphore from a prior test would attach to a torn-down loop.
-    server._run_semaphore = None
     yield
     if server._session_store is not None:
         await server._session_store.shutdown()
@@ -82,7 +79,6 @@ def _override_streaming_config(tmp_path: Path) -> None:
     )
     server._session_store = None
     server._inbox = None
-    server._run_semaphore = None
 
 
 def _make_mock_result(output: str = "Hello from the agent!") -> MagicMock:
@@ -1039,11 +1035,12 @@ async def test_resume_busy_session_enqueues_and_runs_in_order(
         # First item should be running (mailbox was empty before push)
         assert first["status"] == "running"
 
-        # Yield so the worker actually picks up the first item and
-        # blocks inside the slow agent call before we push the second.
-        for _ in range(5):
-            await asyncio.sleep(0)
-        assert "first-start" in call_order
+        # Wait until the worker has picked up the first item and is
+        # blocked inside the slow agent call.
+        await yield_until(
+            lambda: "first-start" in call_order,
+            description="worker enters first agent call",
+        )
 
         # Second push must enqueue, not be rejected
         second = await server._run_skill(
@@ -1173,10 +1170,13 @@ async def test_list_sessions_includes_mailbox_depth(tmp_path: Path) -> None:
             skill, "again", session_id=sid, run_in_background=True
         )
 
-        # Yield so the worker has actually picked up the first item;
-        # mailbox_depth then reflects only the queued (not in-flight) item.
-        for _ in range(5):
-            await asyncio.sleep(0)
+        # Wait until the worker has picked up the first item and is
+        # blocked inside the agent call. At that point mailbox_depth
+        # reflects only the queued (not in-flight) item.
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker enters agent call",
+        )
 
         result_json = await server.list_sessions()
         listing = json.loads(result_json)
@@ -1247,8 +1247,9 @@ def _override_backpressure_config(
     """Reset server singletons with custom backpressure knobs.
 
     Mirrors ``_override_streaming_config`` but for the Phase 6 caps.
-    Resets the run semaphore so a fresh one is built with the new
-    ``max_concurrent_runs`` value on next access.
+    Clearing ``_session_store`` forces a fresh SessionStore (and thus
+    a fresh ``run_semaphore``) on the next access, sized by the
+    config's ``max_concurrent_runs``.
     """
     server._config = ServerConfig(
         session_dir=str(tmp_path / "sessions"),
@@ -1259,7 +1260,29 @@ def _override_backpressure_config(
     )
     server._session_store = None
     server._inbox = None
-    server._run_semaphore = None
+
+
+async def test_env_var_max_concurrent_runs_reaches_store_semaphore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SUBAGENT_MCP_MAX_CONCURRENT_RUNS flows env → config → SessionStore.
+
+    The existing ``test_config.py`` suite verifies the env → ServerConfig
+    leg; this test covers the second leg -- that the config value reaches
+    the SessionStore's run semaphore on bootstrap -- so no one can break
+    the wiring between ``_get_config`` and ``_get_session_store`` without
+    a test failure.
+    """
+    monkeypatch.setenv("SUBAGENT_MCP_MAX_CONCURRENT_RUNS", "3")
+    # Force the server to reload config from the environment on next
+    # access, not from the fixture-installed ServerConfig.
+    server._config = None
+    server._session_store = None
+
+    store = server._get_session_store()
+    # asyncio.Semaphore exposes its current permit count via ``_value``;
+    # on a fresh, unacquired semaphore that equals max_concurrent_runs.
+    assert store.run_semaphore._value == 3
 
 
 async def test_mailbox_full_rejects_background_push(tmp_path: Path) -> None:
@@ -1284,9 +1307,12 @@ async def test_mailbox_full_rejects_background_push(tmp_path: Path) -> None:
 
         first = await server._run_skill(skill, "one", run_in_background=True)
         sid = first["session_id"]
-        # Yield so the worker picks up item 1 (depth becomes 0).
-        for _ in range(5):
-            await asyncio.sleep(0)
+        # Wait until the worker has picked up item 1 and is blocked
+        # inside the agent call (depth becomes 0).
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker picks up first item",
+        )
 
         # Item 2 fits (depth 0 -> 1, cap is 1).
         second = await server._run_skill(
@@ -1338,8 +1364,10 @@ async def test_mailbox_full_rejects_foreground_push(tmp_path: Path) -> None:
         # Background fills the in-flight slot
         first = await server._run_skill(skill, "one", run_in_background=True)
         sid = first["session_id"]
-        for _ in range(5):
-            await asyncio.sleep(0)
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker picks up first item",
+        )
 
         # Background fills the one queued slot (depth 0 -> 1)
         await server._run_skill(
@@ -1357,54 +1385,6 @@ async def test_mailbox_full_rejects_foreground_push(tmp_path: Path) -> None:
         can_finish.set()
         store = server._get_session_store()
         await asyncio.wait_for(store.drain(sid), timeout=1.0)
-
-
-async def test_saturated_rejects_background_when_semaphore_full(
-    tmp_path: Path,
-) -> None:
-    """Background launches return 'saturated' when the run semaphore is full.
-
-    With max_concurrent_runs=1, holding one slot via an in-flight turn
-    in session A means a background launch on session B finds the
-    semaphore locked and rejects immediately.
-    """
-    _override_backpressure_config(tmp_path, max_concurrent_runs=1)
-    skill = _make_skill(tmp_path)
-    can_finish = asyncio.Event()
-
-    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
-        await can_finish.wait()
-        return _make_mock_result()
-
-    with patch.object(server, "_build_agent") as mock_build:
-        mock_agent = AsyncMock()
-        mock_agent.run = AsyncMock(side_effect=blocking_run)
-        mock_build.return_value = mock_agent
-
-        # Session A: starts a background run, holds the only slot
-        a = await server._run_skill(skill, "go", run_in_background=True)
-        a_sid = a["session_id"]
-        # Yield so worker A enters _execute_skill_turn and acquires
-        # the semaphore.
-        for _ in range(10):
-            await asyncio.sleep(0)
-        assert server._get_run_semaphore().locked()
-
-        # Session B: a background launch on a *different* session
-        # must be rejected because the server-wide gate is held.
-        b = await server._run_skill(skill, "go", run_in_background=True)
-        assert b["status"] == "saturated"
-        assert b["max_concurrent_runs"] == 1
-        assert "at capacity" in b["error"]
-        # The rejected launch did NOT create a session worker
-        store = server._get_session_store()
-        b_sid = b["session_id"]
-        assert b_sid != a_sid
-        assert store.has_worker(b_sid) is False
-
-        # Drain A so teardown is clean
-        can_finish.set()
-        await asyncio.wait_for(store.drain(a_sid), timeout=1.0)
 
 
 async def test_foreground_blocks_when_semaphore_saturated(
@@ -1440,13 +1420,17 @@ async def test_foreground_blocks_when_semaphore_saturated(
         # Session A: background run holds the only slot
         a = await server._run_skill(skill, "go", run_in_background=True)
         a_sid = a["session_id"]
-        for _ in range(10):
-            await asyncio.sleep(0)
-        assert server._get_run_semaphore().locked()
+        store = server._get_session_store()
+        await yield_until(
+            lambda: store.run_semaphore.locked(),
+            description="session A acquires the run semaphore",
+        )
 
         # Session B: a foreground launch must NOT reject; it should
         # block until session A finishes and the slot frees up.
         b_task = asyncio.create_task(server._run_skill(skill, "go"))
+        # Give the event loop a few ticks; B should remain pending
+        # because A still holds the only slot.
         for _ in range(5):
             await asyncio.sleep(0)
         assert not b_task.done()
@@ -1457,7 +1441,6 @@ async def test_foreground_blocks_when_semaphore_saturated(
         assert b_result["status"] == "idle"
         assert b_result["response"] == "b-done"
 
-        store = server._get_session_store()
         await asyncio.wait_for(store.drain(a_sid), timeout=1.0)
         await asyncio.wait_for(
             store.drain(b_result["session_id"]), timeout=1.0
@@ -1482,7 +1465,7 @@ async def test_semaphore_releases_after_turn_completes(tmp_path: Path) -> None:
         )
 
         # Semaphore must be free again
-        assert not server._get_run_semaphore().locked()
+        assert not store.run_semaphore.locked()
 
         # A second background launch should not be rejected
         second = await server._run_skill(
@@ -1539,9 +1522,11 @@ async def test_stop_session_tool_cancels_inflight_run(tmp_path: Path) -> None:
 
         first = await server._run_skill(skill, "go", run_in_background=True)
         sid = first["session_id"]
-        # Yield so the worker reaches the blocking agent call
-        for _ in range(10):
-            await asyncio.sleep(0)
+        # Wait until the worker is blocked inside the agent call.
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker enters agent call",
+        )
 
         result_json = await server.stop_session(sid)
         result = json.loads(result_json)
@@ -1567,7 +1552,7 @@ async def test_stop_session_tool_cancels_inflight_run(tmp_path: Path) -> None:
 
     # No worker remains and the semaphore slot is freed
     assert store.has_worker(sid) is False
-    assert not server._get_run_semaphore().locked()
+    assert not store.run_semaphore.locked()
 
 
 async def test_stop_session_tool_drops_queued_items(tmp_path: Path) -> None:
@@ -1589,9 +1574,11 @@ async def test_stop_session_tool_drops_queued_items(tmp_path: Path) -> None:
 
         first = await server._run_skill(skill, "one", run_in_background=True)
         sid = first["session_id"]
-        # Yield so item 1 is in flight (worker entered the agent call)
-        for _ in range(10):
-            await asyncio.sleep(0)
+        # Wait until item 1 is in flight (worker entered the agent call).
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker enters first agent call",
+        )
 
         # Queue two more items behind the in-flight one
         await server._run_skill(
@@ -1636,13 +1623,17 @@ async def test_stop_session_unblocks_foreground_waiter(tmp_path: Path) -> None:
         # Background run holds the worker
         first = await server._run_skill(skill, "go", run_in_background=True)
         sid = first["session_id"]
-        for _ in range(10):
-            await asyncio.sleep(0)
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker enters agent call",
+        )
 
         # Foreground resume sits behind the in-flight item
         fg_task = asyncio.create_task(
             server._run_skill(skill, "again", session_id=sid)
         )
+        # Give the event loop a few ticks; fg_task should remain pending
+        # because the first item is still blocking the worker.
         for _ in range(5):
             await asyncio.sleep(0)
         assert not fg_task.done()
@@ -1670,8 +1661,10 @@ async def test_stop_session_is_idempotent_via_tool(tmp_path: Path) -> None:
 
         first = await server._run_skill(skill, "go", run_in_background=True)
         sid = first["session_id"]
-        for _ in range(10):
-            await asyncio.sleep(0)
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker enters agent call",
+        )
 
         result1 = json.loads(await server.stop_session(sid))
         result2 = json.loads(await server.stop_session(sid))
@@ -1708,8 +1701,10 @@ async def test_stop_session_followed_by_resume(tmp_path: Path) -> None:
 
         first = await server._run_skill(skill, "go", run_in_background=True)
         sid = first["session_id"]
-        for _ in range(10):
-            await asyncio.sleep(0)
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker enters first agent call",
+        )
 
         await server.stop_session(sid)
 
@@ -1748,8 +1743,10 @@ async def test_mailbox_full_does_not_apply_to_skill_mismatch(
 
         first = await server._run_skill(skill_a, "go", run_in_background=True)
         sid = first["session_id"]
-        for _ in range(5):
-            await asyncio.sleep(0)
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker enters first agent call",
+        )
         # Park one item in the mailbox (depth 1, at cap)
         await server._run_skill(
             skill_a, "again", session_id=sid, run_in_background=True

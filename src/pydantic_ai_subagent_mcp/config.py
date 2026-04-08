@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -21,20 +21,22 @@ class ServerConfig:
     tool_timeout: float = 120.0
     srclight_enabled: bool = True
     streaming: bool = True
-    # Backpressure: server-wide cap on in-flight skill turns. The
-    # session worker acquires a slot before running its turn and
-    # releases on exit. Background launches that arrive while the
-    # semaphore is fully held are rejected with status="saturated".
-    # Foreground launches enqueue normally and end up waiting on the
-    # semaphore inside the worker.
+    # Server-wide cap on the number of in-flight skill turns across
+    # all sessions. The session worker acquires a slot from the
+    # SessionStore's semaphore before running its turn and releases
+    # it on exit, so a swarm of background launches cannot saturate
+    # the Ollama backend. Foreground and background callers alike
+    # wait on the semaphore inside the worker; there is no admission-
+    # time rejection (which would be inherently racy against the
+    # execution-time acquire).
     max_concurrent_runs: int = 4
-    # Backpressure: per-session cap on the number of items the
-    # mailbox will hold. Pushes that would push the depth above this
-    # cap are rejected with status="mailbox_full" -- regardless of
-    # foreground/background -- so a runaway producer cannot grow a
-    # session's queue without bound.
+    # Per-session cap on the number of items the mailbox will hold.
+    # Pushes that would exceed the cap are rejected with
+    # status="mailbox_full" -- regardless of foreground/background --
+    # so a runaway producer cannot grow a session's queue without
+    # bound, and a foreground caller cannot bypass the cap by
+    # omitting run_in_background.
     mailbox_max_depth: int = 16
-    extra_env: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def load(cls, config_path: Path | None = None) -> ServerConfig:
@@ -84,7 +86,6 @@ class ServerConfig:
             streaming=streaming_default,
             max_concurrent_runs=max_concurrent,
             mailbox_max_depth=mailbox_max,
-            extra_env=data.get("extra_env", {}),
         )
 
 

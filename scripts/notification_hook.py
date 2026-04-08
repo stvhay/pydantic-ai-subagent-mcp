@@ -50,6 +50,7 @@ import json
 import os
 import sys
 import tempfile
+import uuid
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, TextIO
@@ -64,19 +65,16 @@ CURSOR_FILE = ".cursor"
 # each call so steady-state delivery is preserved.
 READ_LIMIT = 10
 
-# Canonical UUID string length (8-4-4-4-12). Used as a sanity check on
-# the cursor file: anything that doesn't look like a UUID is treated as
-# "no cursor" so a corrupted cursor self-heals on next run instead of
-# silently masking new notifications forever.
-UUID_LEN = 36
-UUID_DASH_COUNT = 4
-
 
 def _read_cursor(cursor_path: Path) -> str:
     """Return the cursor value, or ``""`` if missing/unreadable/invalid.
 
     A garbage cursor (truncated, binary, hand-edited) self-heals to
-    "no cursor" on the next run rather than blocking delivery.
+    "no cursor" on the next run rather than blocking delivery. We
+    parse with ``uuid.UUID`` rather than a shape heuristic so only
+    real UUIDs survive; the canonical form returned by ``str(UUID)``
+    is what lexicographic comparison against on-disk filenames
+    expects.
     """
     if not cursor_path.exists():
         return ""
@@ -84,11 +82,18 @@ def _read_cursor(cursor_path: Path) -> str:
         text = cursor_path.read_text(encoding="utf-8").strip()
     except (OSError, UnicodeDecodeError):
         return ""
-    # Loose UUID shape check -- not a strict parse, just enough to
-    # reject obvious corruption like empty files or stray text.
-    if len(text) != UUID_LEN or text.count("-") != UUID_DASH_COUNT:
+    try:
+        parsed = uuid.UUID(text)
+    except ValueError:
         return ""
-    return text
+    # Reject inputs that round-trip to a different canonical form
+    # (e.g., upper-cased hex, braces, urn:uuid: prefix). The on-disk
+    # filenames are plain lowercase canonical, so only that form is
+    # comparable via lexicographic sort.
+    canonical = str(parsed)
+    if text != canonical:
+        return ""
+    return canonical
 
 
 def _write_cursor(cursor_path: Path, head: str) -> None:

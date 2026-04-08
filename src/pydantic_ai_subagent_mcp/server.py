@@ -32,12 +32,6 @@ _config: ServerConfig | None = None
 _session_store: SessionStore | None = None
 _inbox: Inbox | None = None
 _skills: list[Skill] = []
-# Server-wide concurrency gate. Bounds the number of in-flight
-# ``_execute_skill_turn`` calls across *all* sessions, so a swarm of
-# background launches cannot saturate the host. Created lazily on
-# first access to bind to the running event loop (asyncio.Semaphore
-# remembers which loop it was constructed on).
-_run_semaphore: asyncio.Semaphore | None = None
 
 
 @asynccontextmanager
@@ -68,7 +62,11 @@ def _get_config() -> ServerConfig:
 def _get_session_store() -> SessionStore:
     global _session_store
     if _session_store is None:
-        _session_store = SessionStore(_get_config().session_dir)
+        config = _get_config()
+        _session_store = SessionStore(
+            config.session_dir,
+            max_concurrent_runs=config.max_concurrent_runs,
+        )
     return _session_store
 
 
@@ -77,20 +75,6 @@ def _get_inbox() -> Inbox:
     if _inbox is None:
         _inbox = Inbox(_get_config().inbox_dir)
     return _inbox
-
-
-def _get_run_semaphore() -> asyncio.Semaphore:
-    """Lazily build the server-wide concurrency gate.
-
-    The semaphore is created on first access so it binds to the
-    running event loop. ``asyncio.Semaphore`` is loop-affine; building
-    it eagerly at import or in ``_initialize`` would crash any test
-    that runs in a fresh loop.
-    """
-    global _run_semaphore
-    if _run_semaphore is None:
-        _run_semaphore = asyncio.Semaphore(_get_config().max_concurrent_runs)
-    return _run_semaphore
 
 
 def _build_model(model_name: str | None = None) -> OpenAIChatModel:
@@ -206,11 +190,16 @@ async def _run_skill_streaming(
         except Exception as e:
             _write_trailer(log, "error", e)
             raise
-        except BaseException as e:
-            # Catches CancelledError (client disconnect), KeyboardInterrupt,
-            # SystemExit, GeneratorExit. Write a distinct trailer so tail
-            # clients can distinguish cancellation from normal completion or
-            # error, then re-raise so the runtime tears down cleanly.
+        except (
+            asyncio.CancelledError,
+            KeyboardInterrupt,
+            SystemExit,
+            GeneratorExit,
+        ) as e:
+            # Client disconnect, Ctrl-C, or interpreter teardown. Write
+            # a distinct trailer so tail clients can distinguish
+            # cancellation from normal completion or error, then
+            # re-raise so the runtime tears down cleanly.
             _write_trailer(log, "cancelled", e)
             raise
         else:
@@ -254,7 +243,12 @@ async def _execute_skill_turn(
     session: Session,
     model: str | None,
 ) -> dict[str, Any]:
-    """Run one turn for a session under the per-session lock.
+    """Run one turn for a session.
+
+    Called only from ``_session_worker``. Per-session linearizability
+    is guaranteed by the mailbox FIFO + single-consumer worker model:
+    nothing else is ever executing against this session's messages
+    concurrently, so no lock is needed.
 
     Status transitions: ``running`` is set on entry and persisted so
     external observers (disk readers, ``list_sessions``) see the
@@ -264,76 +258,81 @@ async def _execute_skill_turn(
 
     A completion notification is written to the inbox on every exit
     path (``ok`` / ``error`` / ``cancelled``) so external observers
-    (the Phase 4 hook bridge, ``read_inbox`` callers) can detect
+    (the notification hook, ``read_inbox`` callers) can detect
     completion without polling the session JSON.
 
-    ``CancelledError`` (and any other ``BaseException``) propagates so
-    cancellation tears down cleanly, but the failed status and the
-    cancelled notification are persisted first on a best-effort basis.
+    ``CancelledError`` and the other interpreter-level exceptions
+    propagate so cancellation tears down cleanly, but the failed
+    status and the cancelled notification are persisted first on a
+    best-effort basis.
     """
     store = _get_session_store()
     config = _get_config()
 
-    async with store.lock(session.session_id):
-        session.status = "running"
-        session.last_active = datetime.now(UTC).isoformat()
-        store.save(session)
+    session.status = "running"
+    session.last_active = datetime.now(UTC).isoformat()
+    store.save(session)
 
-        agent = _build_agent(skill, model or session.model)
+    agent = _build_agent(skill, model or session.model)
 
-        try:
-            if config.streaming:
-                output, messages = await _run_skill_streaming(
-                    agent, prompt, session, store
-                )
-            else:
-                result = await agent.run(
-                    prompt,
-                    message_history=session.messages or None,
-                )
-                output = result.output
-                messages = result.all_messages()
-        except Exception as e:
-            session.status = "failed"
-            session.last_active = datetime.now(UTC).isoformat()
-            with suppress(Exception):
-                store.save(session)
-            error_msg = f"Error running skill '{skill.name}': {e}"
-            logger.exception(error_msg)
-            _emit_notification(session, skill, "error", str(e))
-            return {
-                "session_id": session.session_id,
-                "error": error_msg,
-                "model": session.model,
-                "skill": skill.name,
-                "status": "failed",
-            }
-        except BaseException as e:
-            # CancelledError, KeyboardInterrupt, SystemExit. Persist a
-            # failed status so the session is not stuck on "running"
-            # forever, then re-raise so the runtime tears down cleanly.
-            session.status = "failed"
-            session.last_active = datetime.now(UTC).isoformat()
-            with suppress(Exception):
-                store.save(session)
-            _emit_notification(
-                session, skill, "cancelled", f"{type(e).__name__}: {e}"
+    try:
+        if config.streaming:
+            output, messages = await _run_skill_streaming(
+                agent, prompt, session, store
             )
-            raise
-
-        session.messages = messages
-        session.status = "idle"
+        else:
+            result = await agent.run(
+                prompt,
+                message_history=session.messages or None,
+            )
+            output = result.output
+            messages = result.all_messages()
+    except Exception as e:
+        session.status = "failed"
         session.last_active = datetime.now(UTC).isoformat()
-        store.save(session)
-        _emit_notification(session, skill, "ok", output)
-
+        with suppress(Exception):
+            store.save(session)
+        error_msg = f"Error running skill '{skill.name}': {e}"
+        logger.exception(error_msg)
+        _emit_notification(session, skill, "error", str(e))
         return {
             "session_id": session.session_id,
-            "response": output,
+            "error": error_msg,
             "model": session.model,
             "skill": skill.name,
-            "status": "idle",
+            "status": "failed",
         }
+    except (
+        asyncio.CancelledError,
+        KeyboardInterrupt,
+        SystemExit,
+        GeneratorExit,
+    ) as e:
+        # Persist a failed status so the session is not stuck on
+        # "running" forever, then re-raise so the runtime tears
+        # down cleanly.
+        session.status = "failed"
+        session.last_active = datetime.now(UTC).isoformat()
+        with suppress(Exception):
+            store.save(session)
+        _emit_notification(
+            session, skill, "cancelled", f"{type(e).__name__}: {e}"
+        )
+        raise
+
+    session.messages = messages
+    session.status = "idle"
+    session.last_active = datetime.now(UTC).isoformat()
+    store.save(session)
+    _emit_notification(session, skill, "ok", output)
+
+    return {
+        "session_id": session.session_id,
+        "response": output,
+        "model": session.model,
+        "skill": skill.name,
+        "status": "idle",
+    }
 
 
 @dataclass
@@ -356,24 +355,25 @@ async def _session_worker(session_id: str) -> None:
     """Drain a single session's mailbox FIFO, executing one turn at a time.
 
     Lazily started on first push to the session's mailbox, then lives
-    until ``SessionStore.shutdown()`` cancels it. The worker IS the
-    session's serializer: per-session linearizability is guaranteed
-    by the FIFO + single-consumer model, with the per-session lock
-    serving only as defense in depth in case anything bypasses the
-    queue.
+    until ``SessionStore.shutdown()`` or ``stop_session`` cancels it.
+    The worker IS the session's serializer: per-session linearizability
+    is guaranteed by the FIFO + single-consumer model.
+
+    The session is guaranteed to be in the store's cache when the
+    worker dequeues: ``_run_skill`` always calls ``store.get()`` or
+    ``store.create()`` before enqueueing, and nothing evicts from the
+    cache (not even ``stop_session``).
 
     Failure handling:
       * ``_execute_skill_turn`` already catches ``Exception`` and
         returns a dict with an ``error`` field. The worker forwards
-        that dict to the foreground caller's future as a normal result
-        — the error is informational, not exceptional, from the
-        worker's perspective.
-      * ``BaseException`` (``CancelledError``, ``KeyboardInterrupt``,
-        ``SystemExit``) propagates so the worker tears down on
-        shutdown. The current item's future is cancelled or
-        exception-set first so any waiter unblocks. Items still
-        sitting in the mailbox at that point are dropped — Phase 7's
-        ``stop_session`` will add a graceful drain path.
+        that dict to the foreground caller's future as a normal
+        result -- the error is informational, not exceptional, from
+        the worker's perspective.
+      * ``CancelledError`` and the other interpreter-level exceptions
+        propagate so the worker tears down on shutdown. The current
+        item's future is cancelled or exception-set first so any
+        waiter unblocks.
     """
     store = _get_session_store()
     mailbox = store.get_or_create_mailbox(session_id)
@@ -382,29 +382,30 @@ async def _session_worker(session_id: str) -> None:
         item: _WorkItem = await mailbox.get()
         try:
             session = store.get(session_id)
-            if session is None:
-                # Session was deleted between push and pull. Surface
-                # the failure to the waiter (if any) and continue.
-                if item.future is not None and not item.future.done():
-                    item.future.set_exception(
-                        RuntimeError(f"session {session_id} not found")
-                    )
-                continue
+            assert session is not None, (
+                f"session {session_id} missing from cache after admission"
+            )
 
             try:
                 # Server-wide concurrency gate. The worker holds the
                 # slot only for the duration of the actual turn so
                 # mailbox queueing is unaffected: the slot is bound
                 # to in-flight execution, not to admission.
-                async with _get_run_semaphore():
+                async with store.run_semaphore:
                     result = await _execute_skill_turn(
                         item.skill, item.prompt, session, item.model
                     )
-            except BaseException as e:
+            except (
+                asyncio.CancelledError,
+                KeyboardInterrupt,
+                SystemExit,
+                GeneratorExit,
+            ) as e:
                 # _execute_skill_turn caught Exception and returned a
                 # dict with "error", so we only land here on
-                # BaseException -- typically CancelledError during
-                # shutdown. Unblock the waiter, then propagate.
+                # interpreter-level exceptions -- typically
+                # CancelledError during shutdown or stop_session.
+                # Unblock the waiter, then propagate.
                 if item.future is not None and not item.future.done():
                     if isinstance(e, asyncio.CancelledError):
                         item.future.cancel()
@@ -435,7 +436,9 @@ async def _run_skill(
     Foreground (``run_in_background=False``, default) -- Ask mode:
     enqueue an item with a Future, ``await`` the future, return its
     result dict. The caller blocks until *its own* turn completes,
-    not until the whole queue drains.
+    not until the whole queue drains. If the server-wide run
+    semaphore is saturated, the wait happens inside the worker at
+    the semaphore acquire -- the caller simply waits longer.
 
     Background (``run_in_background=True``) -- Tell mode: enqueue an
     item with no future, return immediately. The returned ``status``
@@ -449,19 +452,13 @@ async def _run_skill(
     creation and the message history would be incoherent under
     a different skill's system prompt.
 
-    Backpressure -- two independent rejection paths protect the
-    server from a runaway producer:
-
-    * ``status="mailbox_full"`` (both modes) -- the per-session
-      mailbox already holds ``mailbox_max_depth`` items. Rejection
-      is the same for foreground and background so foreground
-      callers cannot bypass the cap by simply not passing
-      ``run_in_background=True``.
-    * ``status="saturated"`` (background only) -- the server-wide
-      run semaphore is fully held. Background launches return
-      immediately so the caller can react; foreground launches
-      enqueue normally and end up waiting on the semaphore inside
-      the worker, which is the natural Ask-mode behavior.
+    Backpressure -- the per-session mailbox cap is the only
+    admission-time rejection: ``status="mailbox_full"`` for both
+    foreground and background pushes when the queue is full.
+    Foreground callers cannot bypass the cap by omitting
+    ``run_in_background=True``. Server-wide concurrency is bounded
+    by the run semaphore inside the worker, which slows execution
+    without rejecting admissions.
     """
     store = _get_session_store()
     config = _get_config()
@@ -489,9 +486,10 @@ async def _run_skill(
 
     # Per-session mailbox cap. Hard rejection regardless of mode --
     # foreground callers must not be able to bypass the cap by
-    # simply omitting run_in_background. Note this counts queued
-    # items only (mailbox_depth excludes the in-flight one), so the
-    # effective concurrent backlog per session is mailbox_max_depth + 1.
+    # simply omitting run_in_background. ``mailbox_depth`` counts
+    # queued items only (the in-flight one is not in the queue), so
+    # a session can hold up to ``mailbox_max_depth`` queued + 1
+    # in-flight work items concurrently.
     current_depth = store.mailbox_depth(session.session_id)
     if current_depth >= config.mailbox_max_depth:
         return {
@@ -504,29 +502,8 @@ async def _run_skill(
             "error": (
                 f"session {session.session_id} mailbox is full "
                 f"({current_depth}/{config.mailbox_max_depth}); "
-                "retry after the worker drains some pending items"
-            ),
-        }
-
-    # Server-wide saturation check (background only). Foreground
-    # callers always enqueue and end up waiting on the semaphore
-    # inside the worker -- that is the natural Ask-mode behavior
-    # and matches the contract that foreground = "wait until done".
-    # The check is best-effort: between this snapshot and the
-    # worker's actual semaphore acquire a slot may free up, in
-    # which case we reject pessimistically. That is the right side
-    # to err on for backpressure.
-    if run_in_background and _get_run_semaphore().locked():
-        return {
-            "session_id": session.session_id,
-            "status": "saturated",
-            "skill": skill.name,
-            "model": session.model,
-            "max_concurrent_runs": config.max_concurrent_runs,
-            "error": (
-                f"server is at capacity ({config.max_concurrent_runs} "
-                "concurrent runs); retry shortly or run in foreground "
-                "to wait for a slot"
+                "poll tail_session_log or read_inbox for progress, "
+                "or call stop_session to abandon the queued work"
             ),
         }
 
@@ -717,12 +694,12 @@ async def stop_session(session_id: str) -> str:
         "'queued' if it lands behind in-flight work. Resuming a busy session "
         "enqueues the new prompt rather than rejecting it, preserving FIFO "
         "order. Backpressure: a push that would exceed the per-session "
-        "mailbox cap returns status='mailbox_full'; a background launch "
-        "that hits the server-wide concurrency cap returns status='saturated' "
-        "(foreground launches block waiting for a slot). Poll tail_session_log "
-        "for live output and get_session_transcript once the turn completes; "
-        "or wire scripts/notification-hook.sh to receive completion "
-        "notifications via UserPromptSubmit."
+        "mailbox cap returns status='mailbox_full'. Server-wide concurrency "
+        "is bounded inside the worker so callers simply wait longer when "
+        "many sessions are busy. Poll tail_session_log for live output and "
+        "get_session_transcript once the turn completes; or wire "
+        "scripts/notification-hook.sh to receive completion notifications "
+        "via UserPromptSubmit."
     ),
 )
 async def run_skill_by_name(
@@ -761,14 +738,14 @@ async def _check_ollama(config: ServerConfig) -> None:
 
 def _initialize() -> None:
     """Discover skills and register them as MCP tools at startup."""
-    global _skills, _config, _session_store, _inbox, _run_semaphore
+    global _skills, _config, _session_store, _inbox
 
     _config = ServerConfig.load()
-    _session_store = SessionStore(_config.session_dir)
+    _session_store = SessionStore(
+        _config.session_dir,
+        max_concurrent_runs=_config.max_concurrent_runs,
+    )
     _inbox = Inbox(_config.inbox_dir)
-    # Reset to None so the semaphore is rebuilt on first use under
-    # the running event loop (asyncio.Semaphore is loop-affine).
-    _run_semaphore = None
 
     logger.info("Discovering skills...")
     _skills = discover_skills()

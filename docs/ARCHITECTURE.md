@@ -19,11 +19,9 @@ Claude Code (MCP client)
   |               |    +-- MCPServerStdio toolsets --> srclight, self (recursive)
   |               |
   |               +-- SessionStore (JSON on disk, UUID-keyed)
-  |               |    +-- per-session asyncio.Lock (defense in depth)
   |               |    +-- per-session mailbox (asyncio.Queue) + worker task
+  |               |    +-- server-wide asyncio.Semaphore (max_concurrent_runs)
   |               |    \-- per-session .log files for streaming output
-  |               |
-  |               +-- Server-wide asyncio.Semaphore (max_concurrent_runs)
   |               |
   |               \-- Inbox (.subagent-inbox/, uuid7-named JSON files)
   |                     ^
@@ -74,26 +72,30 @@ Claude Code (MCP client)
 
 > In the context of supporting background runs and concurrent resumes against
 > the same session without corrupting transcripts, facing a choice between a
-> global lock (serializes everything), per-session locks alone (linearizable
-> but rejects concurrent resumes), and a per-session mailbox + worker actor
-> model, we chose per-session mailboxes drained by a single long-lived worker
-> task per session. The mailbox FIFO + single-consumer worker is the
-> linearizability primitive; the per-session `asyncio.Lock` remains as
-> defense-in-depth around `_execute_skill_turn` so anything that bypasses the
-> mailbox still cannot interleave reads and writes of `session.messages`.
+> global lock (serializes everything), per-session locks (linearizable but
+> rejects concurrent resumes with nothing to queue them on), and a per-session
+> mailbox + worker actor model, we chose per-session mailboxes drained by a
+> single long-lived worker task per session. The mailbox FIFO + single-consumer
+> worker *is* the linearizability primitive: every turn on a session flows
+> through one queue drained by one task, so `session.messages` is only ever
+> read or written by the worker and no additional lock is necessary. Distinct
+> sessions run on independent workers and never block each other.
 > Backpressure has two independent dimensions: a server-wide
-> `asyncio.Semaphore(max_concurrent_runs)` acquired by the worker around the
-> actual turn execution (so a swarm of background launches across many
-> sessions cannot saturate the host) and a per-session `mailbox_max_depth`
-> cap that bounds queued work behind an in-flight item. Background launches
-> that hit the semaphore cap return `status="saturated"`; pushes that hit
-> the mailbox cap return `status="mailbox_full"`. Foreground (Ask-mode)
-> launches always enqueue and end up waiting on the semaphore inside the
-> worker -- the natural "wait until done" contract. We accept that this
-> design is single-process by construction: the actor model lives entirely
-> inside one event loop and would need a different transport (Redis,
-> message queue) to scale across processes, which is out of scope for a
-> local MCP server.
+> `asyncio.Semaphore(max_concurrent_runs)` owned by the `SessionStore` and
+> acquired by the worker around the actual turn execution (so a swarm of
+> background launches across many sessions cannot saturate the host) and a
+> per-session `mailbox_max_depth` cap that bounds queued work behind an
+> in-flight item. The mailbox cap is the only admission-time rejection:
+> pushes that would exceed it return `status="mailbox_full"` regardless of
+> mode. Foreground and background launches both enqueue unconditionally when
+> the mailbox has room; the wait on the server-wide gate happens inside the
+> worker at the semaphore acquire (callers simply wait longer). There is no
+> admission-time "server too busy" rejection because that would be inherently
+> racy against the execution-time acquire -- the mailbox + semaphore pair
+> are self-regulating. We accept that this design is single-process by
+> construction: the actor model lives entirely inside one event loop and
+> would need a different transport (Redis, message queue) to scale across
+> processes, which is out of scope for a local MCP server.
 
 ### ADR-6: Hook-bridged completion notifications via on-disk outbox
 
@@ -130,7 +132,7 @@ Claude Code (MCP client)
 | `server.py` | FastMCP server, tool registration, agent orchestration; per-session worker tasks; backpressure (run semaphore + mailbox cap); `stop_session` |
 | `config.py` | Configuration from file + environment |
 | `skills.py` | Skill discovery from filesystem |
-| `session.py` | Session persistence with native pydantic-ai messages; per-session `.log` files for streaming output; per-session locks, mailboxes, worker registry, and `stop_session` drain |
+| `session.py` | Session persistence with native pydantic-ai messages; per-session `.log` files for streaming output; per-session mailboxes, worker registry, server-wide run semaphore, and `stop_session` drain |
 | `inbox.py` | Durable on-disk outbox of completion notifications (uuid7-named JSON files, atomic per-record writes, cursor-based forward drain) |
 | `tools.py` | Built-in tools for file I/O, search, shell |
 | `scripts/notification_hook.py` | Standalone Claude Code `UserPromptSubmit` hook bridge that drains the inbox into prompt context (does not import the package) |

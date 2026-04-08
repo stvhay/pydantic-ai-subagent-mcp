@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager, suppress
+from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
+
+logger = logging.getLogger("subagent-mcp.session")
 
 # Lifecycle states for an individual session.
 #
@@ -55,58 +58,58 @@ class Session:
 class SessionStore:
     """Persists sessions to disk as JSON files keyed by UUID.
 
-    Concurrency model: each ``session_id`` has its own ``asyncio.Lock`` that
-    callers must hold via :meth:`lock` while reading-modifying-writing the
-    session's ``messages``. Per-session locks guarantee linearizable history:
-    at most one in-flight turn per session, while distinct sessions remain
-    independent. Persistence is atomic (tempfile + ``os.replace``) so a crash
-    mid-write leaves either the prior or the next coherent state on disk,
-    never a half-written file.
+    Concurrency model: each session is an actor. Work items are
+    enqueued onto a per-session ``asyncio.Queue`` (mailbox) and drained
+    FIFO by a single long-lived worker task. Per-session linearizability
+    is guaranteed by the mailbox + single-consumer worker: one turn at
+    a time, in submission order, with no other coroutine able to touch
+    ``session.messages`` concurrently. Distinct sessions never block
+    each other -- they run on independent workers and only contend on
+    the store's server-wide ``run_semaphore``.
+
+    Server-wide concurrency is bounded by ``run_semaphore``, which the
+    worker acquires around the actual turn execution. The semaphore
+    is owned by the store so its lifecycle matches the store's: a
+    fresh store gets a fresh semaphore on the loop where it is first
+    used, and ``shutdown()`` does not need to reset anything.
+
+    Persistence is atomic (tempfile + ``os.replace``) so a crash
+    mid-write leaves either the prior or the next coherent state on
+    disk, never a half-written file.
     """
 
-    def __init__(self, session_dir: str | Path) -> None:
+    def __init__(
+        self,
+        session_dir: str | Path,
+        *,
+        max_concurrent_runs: int = 4,
+    ) -> None:
         self.session_dir = Path(session_dir)
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self._sessions: dict[str, Session] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
         # Per-session mailbox queues. Each session has at most one
         # ``asyncio.Queue`` of pending work items, drained FIFO by a
         # dedicated worker task. The actor model: a session is an
         # addressable mailbox; a resume is a "tell" to that mailbox.
         self._mailboxes: dict[str, asyncio.Queue[Any]] = {}
-        # Per-session worker tasks. The worker is lazily started on the
-        # first push to the mailbox and lives until ``shutdown()`` is
-        # called (or its loop tears down). One worker per session
-        # guarantees serial execution of that session's turns without
-        # the per-session lock having to do contended work.
+        # Per-session worker tasks. The worker is lazily started on
+        # the first push to the mailbox, lives until ``shutdown()``
+        # or ``stop_session`` tears it down, and blocks on
+        # ``mailbox.get()`` between items so idle sessions cost one
+        # suspended task each. One worker per session is the
+        # linearizability primitive: serial draining guarantees no
+        # two turns of the same session ever run concurrently.
         self._workers: dict[str, asyncio.Task[None]] = {}
+        # Server-wide concurrency gate. Acquired by the worker around
+        # the actual turn execution (not around admission), so
+        # mailbox queueing is unaffected. ``asyncio.Semaphore`` binds
+        # to the event loop on first ``acquire``; constructing it
+        # here is safe because we never acquire outside an async
+        # context.
+        self.run_semaphore = asyncio.Semaphore(max_concurrent_runs)
 
     def _session_path(self, session_id: str) -> Path:
         return self.session_dir / f"{session_id}.json"
-
-    def _get_lock(self, session_id: str) -> asyncio.Lock:
-        """Lazily create and return the per-session asyncio Lock.
-
-        Safe under cooperative concurrency because dict membership check
-        and assignment in pure Python contain no ``await`` points, so no
-        other coroutine can interleave between the check and the create.
-        """
-        lock = self._locks.get(session_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._locks[session_id] = lock
-        return lock
-
-    @asynccontextmanager
-    async def lock(self, session_id: str) -> AsyncIterator[None]:
-        """Acquire the per-session lock for the duration of the context.
-
-        Callers must hold this lock around any read-modify-write of a
-        session's ``messages`` to prevent concurrent turns from clobbering
-        each other's history. Distinct sessions are not blocked.
-        """
-        async with self._get_lock(session_id):
-            yield
 
     def create(self, skill_name: str, model: str) -> Session:
         """Create a new session with a fresh UUID."""
@@ -247,13 +250,24 @@ class SessionStore:
         ``_execute_skill_turn`` will receive ``CancelledError`` and
         the streaming-log "cancelled" trailer / inbox notification
         paths will fire on the way out.
+
+        A worker that raises a non-cancellation exception during
+        shutdown is logged but does not prevent other workers from
+        being torn down -- shutdown must be infallible so we never
+        leak tasks across loops.
         """
-        workers = list(self._workers.values())
-        for w in workers:
+        workers = list(self._workers.items())
+        for _, w in workers:
             w.cancel()
-        for w in workers:
-            with suppress(asyncio.CancelledError, Exception):
+        for sid, w in workers:
+            try:
                 await w
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception(
+                    "session worker for %s raised during shutdown", sid
+                )
         self._workers.clear()
         self._mailboxes.clear()
 
@@ -333,17 +347,29 @@ class SessionStore:
         #   * blocked on mailbox.get() -- cancellation unblocks
         #     immediately, no in-flight item to clean up
         #   * inside _execute_skill_turn -- cancellation propagates
-        #     into the streaming code; the worker's own
-        #     BaseException handler cancels the in-flight item's
-        #     future and the cancelled trailer / inbox notification
-        #     fire on the way out
+        #     into the streaming code; the worker's own cancellation
+        #     handler cancels the in-flight item's future and the
+        #     cancelled trailer / inbox notification fire on the way
+        #     out
         in_flight = 0
         worker = self._workers.get(session_id)
         if worker is not None and not worker.done():
             in_flight = 1
             worker.cancel()
-            with suppress(asyncio.CancelledError, Exception):
+            try:
                 await worker
+            except asyncio.CancelledError:
+                # Expected: we just cancelled it.
+                pass
+            except Exception:
+                # A worker that dies with a non-cancellation exception
+                # is a bug worth surfacing, but stop_session is
+                # contracted to be idempotent and non-raising --
+                # so log it and tear down the rest of the session.
+                logger.exception(
+                    "session worker for %s raised during shutdown",
+                    session_id,
+                )
 
         # Clear registries so the next push to this session starts a
         # fresh worker on a fresh mailbox. Leaving stale entries
