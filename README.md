@@ -95,6 +95,47 @@ Two independent caps protect the server from runaway producers:
 
 Both knobs can be set in `.subagent-mcp.json` or overridden by `SUBAGENT_MCP_MAX_CONCURRENT_RUNS` and `SUBAGENT_MCP_MAILBOX_MAX_DEPTH`. Non-positive or unparseable values silently fall back to the defaults (a misconfigured backpressure knob must never crash the server at boot).
 
+### Example: launch a background run, observe it, stop it
+
+```text
+# Launch a long-running skill in the background -- returns immediately
+> run_skill_by_name(skill_name="research-deep", prompt="...", run_in_background=true)
+{
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "running",
+  "log_path": ".subagent-sessions/550e8400-....log",
+  "mailbox_depth": 1
+}
+
+# Tail the live output as the model streams
+> tail_session_log(session_id="550e8400-...", offset=0)
+{ "text": "Searching for ...", "next_offset": 1234 }
+
+# When the hook is wired, completion shows up in the next prompt context as
+# <subagent-mcp-notification session_id="550e8400-..." status="ok" ...>
+# (or call read_inbox to drain notifications manually)
+
+# If you change your mind, stop the session -- in-flight turn cancels,
+# queued items drop, the cancelled notification fires on the normal
+# completion path
+> stop_session(session_id="550e8400-...")
+{
+  "session_id": "550e8400-...",
+  "status": "stopped",
+  "in_flight_cancelled": 1,
+  "queued_dropped": 0
+}
+
+# A second stop is safe -- idempotent
+> stop_session(session_id="550e8400-...")
+{ "status": "already_idle", "in_flight_cancelled": 0, "queued_dropped": 0 }
+
+# A fresh push to the same session spins up a new worker on a new mailbox
+> run_skill_by_name(skill_name="research-deep", prompt="try again",
+                    session_id="550e8400-...")
+{ "status": "idle", "response": "...", ... }
+```
+
 ## Development
 
 ```bash
@@ -114,18 +155,27 @@ uv run mypy src/
 Claude Code
   |
   |-- MCP (stdio) --> subagent-mcp server
-                        |
-                        |-- discovers skills from .claude/commands/, plugins
-                        |-- registers each as an MCP tool
-                        |-- on tool call:
-                        |     |-- creates pydantic-ai Agent with Ollama model
-                        |     |-- provides built-in tools (files, search, shell, srclight)
-                        |     |-- runs agent with skill prompt + user input
-                        |     |-- persists session transcript
-                        |     \-- returns result
-                        |
-                        \-- session management tools (list, get transcript, resume)
+  |                     |
+  |                     |-- discovers skills from .claude/commands/, plugins
+  |                     |-- registers each as an MCP tool
+  |                     |-- on tool call:
+  |                     |     |-- per-session mailbox + worker actor model
+  |                     |     |-- server-wide concurrency semaphore
+  |                     |     |-- creates pydantic-ai Agent with Ollama model
+  |                     |     |-- streams response to {session_id}.log
+  |                     |     |-- writes completion notification to inbox
+  |                     |     \-- returns result (foreground) or "running" (background)
+  |                     |
+  |                     +-- session tools: list, get transcript, tail log, stop
+  |                     |
+  |                     \-- inbox tools: read_inbox (pull mode)
+  |
+  \-- UserPromptSubmit hook --> notification_hook.py (push mode, drains inbox)
 ```
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for ADRs and
+[docs/DESIGN.md](docs/DESIGN.md) for the full concurrency / backpressure /
+stop semantics.
 
 ## License
 
