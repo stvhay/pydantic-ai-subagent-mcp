@@ -14,14 +14,8 @@
 - Claude Code `UserPromptSubmit` hook bridge (`scripts/notification_hook.py` + `scripts/notification-hook.sh`). On every prompt submit the hook drains new inbox records, emits `<subagent-mcp-notification>` blocks into the next-turn context, and advances a cursor at `.subagent-inbox/.cursor`. The hook is standalone (does not import the package), at-least-once with an idempotent consumer, and fail-soft (always exits 0) so a misconfigured hook cannot break a prompt submit (#19).
 - Session lifecycle fields: `status` (`idle` / `running` / `failed`) and `last_active` are persisted on every save and returned from `list_sessions` alongside a new `mailbox_depth` field (#19).
 - **ACTION:** To receive completion notifications automatically, wire `scripts/notification-hook.sh` as a `UserPromptSubmit` hook in `.claude/settings.json`. See `README.md` for the full hook configuration (#19).
-
-### Changed
-
-- Document mid-stream staleness of `get_session_transcript` in `docs/DESIGN.md`; cross-link `get_session_transcript` and `tail_session_log` MCP tool descriptions so LLM callers pick the right one (#9).
-
-### Added
-
 - Per-turn completion trailer (`--- end ok ---` / `--- end error ---` / `--- end cancelled ---`) on streaming session logs so tail clients can detect completion, errors, and client-disconnect cancellation (#8).
+- Streaming unit tests closing the D1 (resume-from-disk multi-turn) and D3 (concurrent tail mid-stream) coverage gaps from the #4 final integration review. D2 (mid-stream error) was already covered by the trailer tests added in #8 (#11).
 - Streaming skill execution via `agent.run_stream()`, gated by a new `streaming: bool` config field (default `true`) with `SUBAGENT_MCP_STREAMING` env override
 - Per-session append-only `{session_dir}/{session_id}.log` files capturing text deltas with a `--- prompt ---` / `--- response ---` transcript format
 - New `tail_session_log(session_id, offset)` MCP tool for offset-based polling of live stream output
@@ -36,6 +30,10 @@
 - Tests for tools, server, config, session, and skills (28 total)
 - `docs/ARCHITECTURE.md` with system context diagram and ADRs
 - `docs/DESIGN.md` with skill discovery, session, and security patterns
+
+### Changed
+
+- Document mid-stream staleness of `get_session_transcript` in `docs/DESIGN.md`; cross-link `get_session_transcript` and `tail_session_log` MCP tool descriptions so LLM callers pick the right one (#9).
 
 ### Fixed
 
