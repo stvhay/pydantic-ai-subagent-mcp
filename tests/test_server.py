@@ -306,6 +306,59 @@ def _make_failing_stream(
     return _FakeStreamCtx(_FailingStreamResult(chunks_before, exc))  # type: ignore[arg-type]
 
 
+class _QueueStreamResult:
+    """Stream that pulls chunks from an input queue and signals after each yield.
+
+    The producer (test) puts chunks into ``input_q``. After yielding each chunk,
+    the stream puts a marker into ``ready_q`` so the test can deterministically
+    wait for control to return from _run_skill_streaming's write+flush. The
+    sentinel value ``None`` on ``input_q`` ends the stream.
+    """
+
+    def __init__(
+        self,
+        input_q: asyncio.Queue[str | None],
+        ready_q: asyncio.Queue[None],
+        final_output: str,
+        messages: list[ModelMessage],
+    ) -> None:
+        self._input = input_q
+        self._ready = ready_q
+        self._output = final_output
+        self._messages = messages
+
+    async def stream_text(self, *, delta: bool = False) -> AsyncIterator[str]:
+        assert delta is True
+        while True:
+            chunk = await self._input.get()
+            if chunk is None:
+                return
+            yield chunk
+            # Control returns here AFTER _run_skill_streaming has written
+            # the chunk to disk and flushed. Signal the test.
+            await self._ready.put(None)
+
+    async def get_output(self) -> str:
+        return self._output
+
+    def all_messages(self) -> list[ModelMessage]:
+        return self._messages
+
+
+def _make_queue_stream(
+    input_q: asyncio.Queue[str | None],
+    ready_q: asyncio.Queue[None],
+    final_output: str,
+) -> _FakeStreamCtx:
+    messages: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content="test prompt")]),
+        ModelResponse(parts=[TextPart(content=final_output)]),
+    ]
+    return _FakeStreamCtx(  # type: ignore[arg-type]
+        _QueueStreamResult(input_q, ready_q, final_output, messages)
+    )
+
+
 async def test_run_skill_streaming_writes_log(tmp_path: Path) -> None:
     """With streaming=True, _run_skill writes deltas to the session log file."""
     server._config = ServerConfig(
@@ -556,6 +609,142 @@ async def test_run_skill_streaming_cancelled_writes_cancelled_trailer(
     assert last_line.endswith(" ---"), f"unexpected last line: {last_line!r}"
     assert "--- end ok " not in log_text
     assert "--- end error " not in log_text
+
+
+async def test_run_skill_streaming_resumes_from_disk_and_appends_log(
+    tmp_path: Path,
+) -> None:
+    """Resuming a session after dropping the in-memory store reads history off
+    disk via ModelMessagesTypeAdapter and threads it into agent.run_stream.
+
+    Simulates the realistic restart path: turn 1 runs, the server is
+    "restarted" by clearing server._session_store, turn 2 runs against a
+    fresh SessionStore that must re-hydrate messages from JSON.
+    """
+    server._config = ServerConfig(
+        session_dir=str(tmp_path / "sessions"),
+        streaming=True,
+    )
+    server._session_store = None  # force rebuild with new config
+
+    skill = _make_skill(tmp_path)
+
+    # ---- Turn 1 ----
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = MagicMock()
+        mock_agent.run_stream = MagicMock(
+            return_value=_make_fake_stream(["Response", " one"], "Response one")
+        )
+        mock_build.return_value = mock_agent
+
+        result1 = await server._run_skill(skill, "first")
+
+    session_id = result1["session_id"]
+    assert "error" not in result1
+
+    # ---- Simulate restart: drop the in-memory store and rebuild ----
+    server._session_store = None  # next _get_session_store() rebuilds
+
+    # ---- Turn 2 ----
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = MagicMock()
+        mock_agent.run_stream = MagicMock(
+            return_value=_make_fake_stream(["Response", " two"], "Response two")
+        )
+        mock_build.return_value = mock_agent
+
+        result2 = await server._run_skill(skill, "second", session_id=session_id)
+
+    assert result2["session_id"] == session_id
+    assert "error" not in result2
+
+    # The new store should have read history off disk and threaded it
+    # into agent.run_stream.
+    second_call_kwargs = mock_agent.run_stream.call_args.kwargs
+    history = second_call_kwargs["message_history"]
+    assert history is not None
+    assert len(history) == 2  # request + response from turn 1, round-tripped
+
+    # Log file accumulates both turns' header blocks.
+    store = server._get_session_store()
+    log_text = store.log_path(session_id).read_text()
+    assert log_text.count("--- response ---") == 2
+    assert log_text.count("--- end ok ") == 2
+    assert "first" in log_text
+    assert "second" in log_text
+
+
+async def test_tail_session_log_reads_mid_stream(tmp_path: Path) -> None:
+    """tail_session_log observes flushed deltas while the stream is in flight.
+
+    Validates the per-chunk log.flush() at server.py:172. Uses an
+    asyncio.Queue paired-handshake pattern (input queue + back-channel
+    ready queue) so the test deterministically waits for the write+flush
+    before tailing — no asyncio.sleep, no polling, no race.
+    """
+    server._config = ServerConfig(
+        session_dir=str(tmp_path / "sessions"),
+        streaming=True,
+    )
+    server._session_store = None
+
+    skill = _make_skill(tmp_path)
+    input_q: asyncio.Queue[str | None] = asyncio.Queue()
+    ready_q: asyncio.Queue[None] = asyncio.Queue()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = MagicMock()
+        mock_agent.run_stream = MagicMock(
+            return_value=_make_queue_stream(input_q, ready_q, "hello world")
+        )
+        mock_build.return_value = mock_agent
+
+        # Launch the streaming run as a Task so the test can interleave with it.
+        task = asyncio.create_task(server._run_skill(skill, "say hi"))
+
+        # Push the first chunk and wait for it to be written + flushed.
+        await input_q.put("hello ")
+        await ready_q.get()
+
+        # Mid-stream tail: log file exists, the response marker and the first
+        # chunk should both be visible BEFORE the second chunk is sent.
+        store = server._get_session_store()
+        # We don't have a session_id yet (the task is still running) — find
+        # the only log file in the session_dir.
+        log_files = list(store.session_dir.glob("*.log"))
+        assert len(log_files) == 1, f"expected one log file, got {log_files}"
+        session_id = log_files[0].stem
+
+        result_json = await server.tail_session_log(session_id, offset=0)
+        result = json.loads(result_json)
+        assert "hello " in result["text"]
+        assert "--- response ---\n" in result["text"]
+        assert result["next_offset"] > 0
+        first_offset = result["next_offset"]
+
+        # Push the second chunk and wait for flush.
+        await input_q.put("world")
+        await ready_q.get()
+
+        # Incremental tail from previous offset returns only the new bytes.
+        result2_json = await server.tail_session_log(
+            session_id, offset=first_offset
+        )
+        result2 = json.loads(result2_json)
+        assert "world" in result2["text"]
+        assert "hello " not in result2["text"]  # not re-read
+
+        # End the stream cleanly and wait for the task.
+        await input_q.put(None)
+        final = await task
+
+    assert "error" not in final
+    assert final["session_id"] == session_id
+
+    # Final log has both chunks plus the ok trailer.
+    final_text = store.log_path(session_id).read_text()
+    assert "hello world" in final_text
+    assert "--- end ok " in final_text
 
 
 async def test_tail_session_log_tool_returns_bytes(tmp_path: Path) -> None:
