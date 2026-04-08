@@ -45,6 +45,43 @@ Create `.subagent-mcp.json` in your project root:
 
 Environment variables `OLLAMA_BASE_URL`, `SUBAGENT_MCP_DEFAULT_MODEL`, and `SUBAGENT_MCP_STREAMING` override the config file.
 
+## Background runs and completion notifications
+
+Skill invocations can be launched in the background by passing `run_in_background=true` to `run_skill_by_name`. The MCP call returns immediately with `status: "running"` and a `session_id`; the run continues on the server's event loop. Use `tail_session_log` to poll live output and `get_session_transcript` once the run completes.
+
+When a background run finishes, a small JSON record is appended to `.subagent-inbox/{notification_id}.json`. There are two ways to consume them:
+
+1. **Polled** — call the `read_inbox` MCP tool. It returns unread records and a cursor; pass the cursor back as `since` on the next call to advance.
+2. **Pushed via Claude Code hook** — wire `scripts/notification-hook.sh` as a `UserPromptSubmit` hook. On every prompt submit, the hook drains new inbox records and emits a `<subagent-mcp-notification>` block per record, which Claude Code injects into the next-turn context. No polling required.
+
+To enable the hook, add this to `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/abs/path/to/pydantic-ai-subagent-mcp/scripts/notification-hook.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Properties of the hook:
+
+- **At-least-once delivery, idempotent consumer** — the hook tracks its own cursor at `.subagent-inbox/.cursor`. A crash mid-write redelivers the same notification on the next prompt; a corrupted cursor self-heals to "no cursor" instead of silently masking new notifications.
+- **Standalone** — `notification_hook.py` reads the inbox directory directly and does not import the `pydantic_ai_subagent_mcp` package, so the hook keeps working even if the server is uninstalled or downgraded.
+- **Bounded latency and noise** — each invocation emits at most 10 notifications. A backlog drains across successive prompts.
+- **Safe defaults** — exits 0 on any error so a misconfigured hook can never break your prompt submit.
+
+If your inbox lives outside the project root, set `SUBAGENT_MCP_INBOX_DIR` in the hook environment.
+
 ## Development
 
 ```bash
