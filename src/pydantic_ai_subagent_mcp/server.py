@@ -709,11 +709,11 @@ async def run_skill_by_name(
     session_id: str = "",
     run_in_background: bool = False,
 ) -> str:
-    matching = [s for s in _skills if s.name == skill_name]
-    if not matching:
+    skill = next((s for s in _skills if s.name == skill_name), None)
+    if skill is None:
         return json.dumps({"error": f"Skill '{skill_name}' not found"})
     result = await _run_skill(
-        matching[0],
+        skill,
         prompt,
         model=model or None,
         session_id=session_id or None,

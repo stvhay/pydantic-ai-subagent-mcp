@@ -34,6 +34,11 @@
 ### Changed
 
 - Document mid-stream staleness of `get_session_transcript` in `docs/DESIGN.md`; cross-link `get_session_transcript` and `tail_session_log` MCP tool descriptions so LLM callers pick the right one (#9).
+- `run_skill_by_name` now resolves the skill via `next(...)` instead of building an intermediate list, a small readability cleanup with no behavior change.
+
+### Removed
+
+- Dead config knobs `max_iterations`, `tool_timeout`, and `srclight_enabled` from `ServerConfig`. They were declared, defaulted, and parsed from `.subagent-mcp.json` but never read by any production code path. The `srclight` MCP server is still listed as a dependency (and remains usable when wired through `.mcp.json`); only the unused config flag is gone. Existing `.subagent-mcp.json` files that still set these keys keep working — unknown keys are silently ignored by the loader — but the keys no longer do anything and can be deleted.
 
 ### Fixed
 

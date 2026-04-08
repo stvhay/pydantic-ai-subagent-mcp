@@ -17,9 +17,6 @@ class ServerConfig:
     default_model: str = "gemma4:12b"
     session_dir: str = ".subagent-sessions"
     inbox_dir: str = ".subagent-inbox"
-    max_iterations: int = 50
-    tool_timeout: float = 120.0
-    srclight_enabled: bool = True
     streaming: bool = True
     # Server-wide cap on the number of in-flight skill turns across
     # all sessions. The session worker acquires a slot from the
@@ -80,9 +77,6 @@ class ServerConfig:
             ),
             session_dir=data.get("session_dir", cls.session_dir),
             inbox_dir=data.get("inbox_dir", cls.inbox_dir),
-            max_iterations=int(data.get("max_iterations", cls.max_iterations)),
-            tool_timeout=float(data.get("tool_timeout", cls.tool_timeout)),
-            srclight_enabled=data.get("srclight_enabled", cls.srclight_enabled),
             streaming=streaming_default,
             max_concurrent_runs=max_concurrent,
             mailbox_max_depth=mailbox_max,

@@ -38,8 +38,7 @@ Create `.subagent-mcp.json` in your project root:
   "ollama_base_url": "http://localhost:11434",
   "default_model": "gemma4:12b",
   "session_dir": ".subagent-sessions",
-  "streaming": true,
-  "srclight_enabled": true
+  "streaming": true
 }
 ```
 
