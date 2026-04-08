@@ -558,6 +558,69 @@ async def test_run_skill_streaming_cancelled_writes_cancelled_trailer(
     assert "--- end error " not in log_text
 
 
+async def test_run_skill_streaming_resumes_from_disk_and_appends_log(
+    tmp_path: Path,
+) -> None:
+    """Resuming a session after dropping the in-memory store reads history off
+    disk via ModelMessagesTypeAdapter and threads it into agent.run_stream.
+
+    Simulates the realistic restart path: turn 1 runs, the server is
+    "restarted" by clearing server._session_store, turn 2 runs against a
+    fresh SessionStore that must re-hydrate messages from JSON.
+    """
+    server._config = ServerConfig(
+        session_dir=str(tmp_path / "sessions"),
+        streaming=True,
+    )
+    server._session_store = None  # force rebuild with new config
+
+    skill = _make_skill(tmp_path)
+
+    # ---- Turn 1 ----
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = MagicMock()
+        mock_agent.run_stream = MagicMock(
+            return_value=_make_fake_stream(["Response", " one"], "Response one")
+        )
+        mock_build.return_value = mock_agent
+
+        result1 = await server._run_skill(skill, "first")
+
+    session_id = result1["session_id"]
+    assert "error" not in result1
+
+    # ---- Simulate restart: drop the in-memory store and rebuild ----
+    server._session_store = None  # next _get_session_store() rebuilds
+
+    # ---- Turn 2 ----
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = MagicMock()
+        mock_agent.run_stream = MagicMock(
+            return_value=_make_fake_stream(["Response", " two"], "Response two")
+        )
+        mock_build.return_value = mock_agent
+
+        result2 = await server._run_skill(skill, "second", session_id=session_id)
+
+    assert result2["session_id"] == session_id
+    assert "error" not in result2
+
+    # The new store should have read history off disk and threaded it
+    # into agent.run_stream.
+    second_call_kwargs = mock_agent.run_stream.call_args.kwargs
+    history = second_call_kwargs["message_history"]
+    assert history is not None
+    assert len(history) == 2  # request + response from turn 1, round-tripped
+
+    # Log file accumulates both turns' header blocks.
+    store = server._get_session_store()
+    log_text = store.log_path(session_id).read_text()
+    assert log_text.count("--- response ---") == 2
+    assert log_text.count("--- end ok ") == 2
+    assert "first" in log_text
+    assert "second" in log_text
+
+
 async def test_tail_session_log_tool_returns_bytes(tmp_path: Path) -> None:
     """tail_session_log tool reads from the session log at a given offset."""
     store = server._get_session_store()
