@@ -598,3 +598,252 @@ async def test_tail_session_log_tool_nonexistent() -> None:
     result = json.loads(result_json)
     assert result["text"] == ""
     assert result["next_offset"] == 0
+
+
+# -- Phase 2: background execution, status transitions, busy reject --
+
+
+async def test_run_skill_status_transitions_idle_to_idle(tmp_path: Path) -> None:
+    """A successful foreground run leaves the session idle and bumps last_active."""
+    skill = _make_skill(tmp_path)
+    mock_result = _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=mock_result)
+        mock_build.return_value = mock_agent
+
+        result = await server._run_skill(skill, "say hello")
+
+    assert result["status"] == "idle"
+    store = server._get_session_store()
+    session = store.get(result["session_id"])
+    assert session is not None
+    assert session.status == "idle"
+    # last_active should have advanced past created_at after the turn
+    assert session.last_active >= session.created_at
+
+
+async def test_run_skill_status_transitions_to_failed_on_error(
+    tmp_path: Path,
+) -> None:
+    """An exception during the agent call leaves the session in 'failed'."""
+    skill = _make_skill(tmp_path)
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=RuntimeError("ollama down"))
+        mock_build.return_value = mock_agent
+
+        result = await server._run_skill(skill, "say hello")
+
+    assert "error" in result
+    assert result["status"] == "failed"
+    store = server._get_session_store()
+    session = store.get(result["session_id"])
+    assert session is not None
+    assert session.status == "failed"
+
+
+async def test_run_skill_persists_running_status_during_turn(
+    tmp_path: Path,
+) -> None:
+    """While the agent call is in flight, the on-disk status reads 'running'.
+
+    Verifies that observers reading list_sessions or session JSON during a
+    turn see the in-flight state, not the stale prior status.
+    """
+    skill = _make_skill(tmp_path)
+    store = server._get_session_store()
+    observed: dict[str, str] = {}
+
+    async def slow_run(*_a: object, **_k: object) -> MagicMock:
+        # Read the on-disk session JSON from inside the agent call to
+        # verify it shows status=running
+        sessions = store.list_sessions()
+        observed["status"] = sessions[0]["status"]
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=slow_run)
+        mock_build.return_value = mock_agent
+
+        await server._run_skill(skill, "go")
+
+    assert observed["status"] == "running"
+
+
+async def test_run_skill_background_returns_immediately(tmp_path: Path) -> None:
+    """A background launch returns before the agent call resolves."""
+    skill = _make_skill(tmp_path)
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result("background done")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        # The background launch must return promptly even though the agent
+        # call is still blocked. Bound it with wait_for so a regression
+        # would fail with TimeoutError instead of hanging the suite.
+        result = await asyncio.wait_for(
+            server._run_skill(skill, "go", run_in_background=True),
+            timeout=1.0,
+        )
+
+        assert result["status"] == "running"
+        assert "session_id" in result
+        assert "log_path" in result
+        assert "response" not in result  # response only on completion
+        session_id = result["session_id"]
+
+        # The store should report the session as busy while the task is in flight
+        store = server._get_session_store()
+        assert store.is_running(session_id) is True
+
+        # Let the task finish and verify final state
+        can_finish.set()
+        # Drain the registered task so we don't leak it
+        task = store._tasks.get(session_id)
+        if task is not None:
+            await task
+        await asyncio.sleep(0)  # let done callback run
+
+        assert store.is_running(session_id) is False
+        session = store.get(session_id)
+        assert session is not None
+        assert session.status == "idle"
+        # The completed run wrote messages back to the session
+        assert len(session.messages) == 2
+
+
+async def test_run_skill_resume_busy_session_rejected(tmp_path: Path) -> None:
+    """Resuming a session with an in-flight task returns status='busy'."""
+    skill = _make_skill(tmp_path)
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        # Start a background run
+        first = await server._run_skill(skill, "first", run_in_background=True)
+        session_id = first["session_id"]
+
+        # Resume attempt while busy must fail-fast — bound it so a regression
+        # (where it blocks on the lock) would surface as TimeoutError
+        second = await asyncio.wait_for(
+            server._run_skill(skill, "second", session_id=session_id),
+            timeout=1.0,
+        )
+        assert second["status"] == "busy"
+        assert second["session_id"] == session_id
+        assert "response" not in second
+
+        # Background resume on the same busy session is also rejected
+        third = await asyncio.wait_for(
+            server._run_skill(
+                skill, "third", session_id=session_id, run_in_background=True
+            ),
+            timeout=1.0,
+        )
+        assert third["status"] == "busy"
+
+        # Drain the original task
+        can_finish.set()
+        store = server._get_session_store()
+        task = store._tasks.get(session_id)
+        if task is not None:
+            await task
+        await asyncio.sleep(0)
+
+
+async def test_run_skill_resume_after_completion_succeeds(tmp_path: Path) -> None:
+    """Once the in-flight task completes, the session is resumable again."""
+    skill = _make_skill(tmp_path)
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(
+            side_effect=[_make_mock_result("one"), _make_mock_result("two")]
+        )
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(
+            skill, "first", run_in_background=True
+        )
+        session_id = first["session_id"]
+
+        # Drain the background task
+        store = server._get_session_store()
+        task = store._tasks.get(session_id)
+        assert task is not None
+        await task
+        await asyncio.sleep(0)
+        assert store.is_running(session_id) is False
+
+        # Now a resume should succeed (foreground)
+        second = await server._run_skill(
+            skill, "second", session_id=session_id
+        )
+        assert second["status"] == "idle"
+        assert second["session_id"] == session_id
+        assert second["response"] == "two"
+
+
+async def test_run_skill_by_name_background(tmp_path: Path) -> None:
+    """The MCP tool wrapper passes run_in_background through correctly."""
+    skill = _make_skill(tmp_path)
+    server._skills = [skill]
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        result_json = await asyncio.wait_for(
+            server.run_skill_by_name(
+                skill.name, "go", run_in_background=True
+            ),
+            timeout=1.0,
+        )
+        result = json.loads(result_json)
+        assert result["status"] == "running"
+
+        # Drain
+        can_finish.set()
+        store = server._get_session_store()
+        task = store._tasks.get(result["session_id"])
+        if task is not None:
+            await task
+        await asyncio.sleep(0)
+
+
+async def test_list_sessions_tool_exposes_status(tmp_path: Path) -> None:
+    """The list_sessions MCP tool surfaces the new status/last_active fields."""
+    store = server._get_session_store()
+    s = store.create("skill-a", "gemma4:12b")
+    s.status = "running"
+    s.last_active = "2026-04-08T10:00:00+00:00"
+    store.save(s)
+
+    result_json = await server.list_sessions()
+    result = json.loads(result_json)
+    assert len(result) == 1
+    assert result[0]["status"] == "running"
+    assert result[0]["last_active"] == "2026-04-08T10:00:00+00:00"

@@ -15,7 +15,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
-from pydantic_ai_subagent_mcp.session import SessionStore
+from pydantic_ai_subagent_mcp.session import Session, SessionStore
 
 
 def _make_messages() -> list[ModelMessage]:
@@ -238,3 +238,136 @@ def test_atomic_persist_cleans_tempfile_on_error(
     # No tempfile leaked
     leftover = [p.name for p in session_dir.iterdir() if p.name.endswith(".tmp")]
     assert leftover == []
+
+
+# -- Phase 2: status enum, last_active, task registry --
+
+
+def test_new_session_starts_idle_with_last_active(tmp_path: Path) -> None:
+    """A freshly created session has status=idle and last_active=created_at."""
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create("skill", "gemma4:12b")
+    assert session.status == "idle"
+    assert session.last_active == session.created_at
+
+
+def test_session_status_round_trips_through_disk(tmp_path: Path) -> None:
+    """status and last_active survive a save/reload cycle."""
+    session_dir = tmp_path / "sessions"
+    store = SessionStore(session_dir)
+    session = store.create("skill", "gemma4:12b")
+    session.status = "running"
+    session.last_active = "2026-04-08T12:34:56+00:00"
+    store.save(session)
+
+    store2 = SessionStore(session_dir)
+    loaded = store2.get(session.session_id)
+    assert loaded is not None
+    assert loaded.status == "running"
+    assert loaded.last_active == "2026-04-08T12:34:56+00:00"
+
+
+def test_session_to_dict_includes_status_and_last_active(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create("skill", "gemma4:12b")
+    session.status = "failed"
+    session.last_active = "2026-04-08T01:02:03+00:00"
+
+    d = session.to_dict()
+    assert d["status"] == "failed"
+    assert d["last_active"] == "2026-04-08T01:02:03+00:00"
+
+
+def test_legacy_session_files_default_to_idle(tmp_path: Path) -> None:
+    """Pre-Phase-2 session files (no status/last_active fields) load as idle."""
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    sid = "legacy-uuid"
+    legacy = {
+        "session_id": sid,
+        "skill_name": "skill",
+        "model": "gemma4:12b",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "messages": [],
+    }
+    (session_dir / f"{sid}.json").write_text(json.dumps(legacy))
+
+    store = SessionStore(session_dir)
+    loaded = store.get(sid)
+    assert loaded is not None
+    assert loaded.status == "idle"
+    assert loaded.last_active == "2026-01-01T00:00:00+00:00"
+
+
+def test_list_sessions_exposes_status_and_last_active(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    a = store.create("skill-a", "gemma4:12b")
+    a.status = "running"
+    a.last_active = "2026-04-08T10:00:00+00:00"
+    store.save(a)
+
+    listing = store.list_sessions()
+    assert len(listing) == 1
+    entry = listing[0]
+    assert entry["status"] == "running"
+    assert entry["last_active"] == "2026-04-08T10:00:00+00:00"
+
+
+async def test_register_task_and_is_running(tmp_path: Path) -> None:
+    """register_task tracks the task; is_running reflects task.done()."""
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create("skill", "gemma4:12b")
+
+    started = asyncio.Event()
+    can_finish = asyncio.Event()
+
+    async def slow() -> str:
+        started.set()
+        await can_finish.wait()
+        return "done"
+
+    task = asyncio.create_task(slow())
+    store.register_task(session.session_id, task)
+
+    await started.wait()
+    assert store.is_running(session.session_id) is True
+
+    can_finish.set()
+    await task
+    # add_done_callback runs synchronously after await; yield once to let it fire
+    await asyncio.sleep(0)
+    assert store.is_running(session.session_id) is False
+    # Registry was cleaned up by the done callback
+    assert session.session_id not in store._tasks
+
+
+async def test_is_running_returns_false_for_unknown_session(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    assert store.is_running("never-registered") is False
+
+
+def test_touch_updates_last_active_in_cache(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create("skill", "gemma4:12b")
+    original = session.last_active
+    # Touch should set last_active to a timestamp >= the original
+    store.touch(session.session_id)
+    assert session.last_active >= original
+
+
+def test_touch_unknown_session_is_noop(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    store.touch("never-existed")  # must not raise
+
+
+def test_session_dataclass_defaults() -> None:
+    """Session can still be constructed with the minimum required fields."""
+    s = Session(
+        session_id="abc",
+        skill_name="skill",
+        model="gemma4:12b",
+        created_at="2026-04-08T00:00:00+00:00",
+    )
+    assert s.status == "idle"
+    assert s.last_active == ""
+    assert s.messages == []

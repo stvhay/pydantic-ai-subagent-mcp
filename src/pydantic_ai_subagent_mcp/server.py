@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sys
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from typing import Any, TextIO
 
@@ -187,34 +188,32 @@ async def _run_skill_streaming(
     return output, messages
 
 
-async def _run_skill(
+async def _execute_skill_turn(
     skill: Skill,
     prompt: str,
-    model: str | None = None,
-    session_id: str | None = None,
+    session: Session,
+    model: str | None,
 ) -> dict[str, Any]:
-    """Execute a skill with the subagent and return results.
+    """Run one turn for a session under the per-session lock.
 
-    Concurrency: holds the per-session lock from the start of the agent
-    invocation through the persistence of the resulting message_history.
-    Concurrent calls against the same session_id serialize linearizably,
-    so a session's history is never interleaved or clobbered. Distinct
-    sessions remain independent.
+    Status transitions: ``running`` is set on entry and persisted so
+    external observers (disk readers, ``list_sessions``) see the
+    in-flight state. On success the status flips back to ``idle``; on
+    any exception or cancellation it flips to ``failed``. ``last_active``
+    is bumped at every transition.
+
+    ``CancelledError`` (and any other ``BaseException``) propagates so
+    cancellation tears down cleanly, but the failed status is persisted
+    first on a best-effort basis.
     """
     store = _get_session_store()
     config = _get_config()
 
-    # Resume or create session. Resolution happens before acquiring the
-    # lock so we have a session_id to lock on; for new sessions there can
-    # be no concurrent writers anyway since the UUID is fresh.
-    session = None
-    if session_id:
-        session = store.get(session_id)
-    if session is None:
-        effective_model = model or config.default_model
-        session = store.create(skill.name, effective_model)
-
     async with store.lock(session.session_id):
+        session.status = "running"
+        session.last_active = datetime.now(UTC).isoformat()
+        store.save(session)
+
         agent = _build_agent(skill, model or session.model)
 
         try:
@@ -229,17 +228,11 @@ async def _run_skill(
                 )
                 output = result.output
                 messages = result.all_messages()
-
-            session.messages = messages
-            store.save(session)
-
-            return {
-                "session_id": session.session_id,
-                "response": output,
-                "model": session.model,
-                "skill": skill.name,
-            }
         except Exception as e:
+            session.status = "failed"
+            session.last_active = datetime.now(UTC).isoformat()
+            with suppress(Exception):
+                store.save(session)
             error_msg = f"Error running skill '{skill.name}': {e}"
             logger.exception(error_msg)
             return {
@@ -247,7 +240,86 @@ async def _run_skill(
                 "error": error_msg,
                 "model": session.model,
                 "skill": skill.name,
+                "status": "failed",
             }
+        except BaseException:
+            # CancelledError, KeyboardInterrupt, SystemExit. Persist a
+            # failed status so the session is not stuck on "running"
+            # forever, then re-raise so the runtime tears down cleanly.
+            session.status = "failed"
+            session.last_active = datetime.now(UTC).isoformat()
+            with suppress(Exception):
+                store.save(session)
+            raise
+
+        session.messages = messages
+        session.status = "idle"
+        session.last_active = datetime.now(UTC).isoformat()
+        store.save(session)
+
+        return {
+            "session_id": session.session_id,
+            "response": output,
+            "model": session.model,
+            "skill": skill.name,
+            "status": "idle",
+        }
+
+
+async def _run_skill(
+    skill: Skill,
+    prompt: str,
+    model: str | None = None,
+    session_id: str | None = None,
+    run_in_background: bool = False,
+) -> dict[str, Any]:
+    """Execute a skill, optionally in the background.
+
+    Foreground (default): runs to completion under the per-session lock
+    and returns the final response (or error). Background: schedules
+    the turn as an ``asyncio.Task`` tracked by the SessionStore and
+    returns immediately with ``status="running"`` so the caller can
+    poll the log via ``tail_session_log`` and the structured transcript
+    via ``get_session_transcript`` once the run completes.
+
+    Resume on a busy session is rejected with ``status="busy"`` —
+    proper mailbox queueing arrives in Phase 5.
+    """
+    store = _get_session_store()
+    config = _get_config()
+
+    # Resume or create session. Resolution happens before acquiring the
+    # lock so we have a session_id to lock on; for new sessions there can
+    # be no concurrent writers anyway since the UUID is fresh.
+    session: Session | None = None
+    if session_id:
+        session = store.get(session_id)
+        if session is not None and store.is_running(session.session_id):
+            # Fail-fast on busy sessions: do not block on the lock.
+            return {
+                "session_id": session.session_id,
+                "status": "busy",
+                "skill": skill.name,
+                "model": session.model,
+            }
+    if session is None:
+        effective_model = model or config.default_model
+        session = store.create(skill.name, effective_model)
+
+    if run_in_background:
+        task = asyncio.create_task(
+            _execute_skill_turn(skill, prompt, session, model)
+        )
+        store.register_task(session.session_id, task)
+        return {
+            "session_id": session.session_id,
+            "status": "running",
+            "skill": skill.name,
+            "model": session.model,
+            "log_path": str(store.log_path(session.session_id)),
+        }
+
+    return await _execute_skill_turn(skill, prompt, session, model)
 
 
 def _register_skill_tool(skill: Skill) -> None:
@@ -261,12 +333,14 @@ def _register_skill_tool(skill: Skill) -> None:
         prompt: str,
         model: str = "",
         session_id: str = "",
+        run_in_background: bool = False,
     ) -> str:
         result = await _run_skill(
             skill,
             prompt,
             model=model or None,
             session_id=session_id or None,
+            run_in_background=run_in_background,
         )
         return json.dumps(result, indent=2)
 
@@ -334,7 +408,11 @@ async def tail_session_log(session_id: str, offset: int = 0) -> str:
     name="run_skill_by_name",
     description=(
         "Run any skill by name with a prompt. Use this when you know the skill name "
-        "but it wasn't registered as a dedicated tool."
+        "but it wasn't registered as a dedicated tool. Set run_in_background=true "
+        "to spawn the run as a background task and return immediately with "
+        "status='running'; poll tail_session_log for live output and "
+        "get_session_transcript once it completes. Resuming a busy session "
+        "returns status='busy' (mailbox queueing arrives in a later phase)."
     ),
 )
 async def run_skill_by_name(
@@ -342,6 +420,7 @@ async def run_skill_by_name(
     prompt: str,
     model: str = "",
     session_id: str = "",
+    run_in_background: bool = False,
 ) -> str:
     matching = [s for s in _skills if s.name == skill_name]
     if not matching:
@@ -351,6 +430,7 @@ async def run_skill_by_name(
         prompt,
         model=model or None,
         session_id=session_id or None,
+        run_in_background=run_in_background,
     )
     return json.dumps(result, indent=2)
 

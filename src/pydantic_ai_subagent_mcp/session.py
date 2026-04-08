@@ -12,9 +12,17 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
+
+# Lifecycle states for an individual session.
+#
+# - ``idle``: no in-flight turn; safe to resume.
+# - ``running``: a turn is currently executing for this session.
+# - ``failed``: the most recent turn raised; the session is still resumable
+#   (the failure is informational, not a terminal state).
+SessionStatus = Literal["idle", "running", "failed"]
 
 
 @dataclass
@@ -26,6 +34,8 @@ class Session:
     model: str
     created_at: str
     messages: list[ModelMessage] = field(default_factory=list)
+    status: SessionStatus = "idle"
+    last_active: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         messages_json = json.loads(
@@ -36,6 +46,8 @@ class Session:
             "skill_name": self.skill_name,
             "model": self.model,
             "created_at": self.created_at,
+            "status": self.status,
+            "last_active": self.last_active or self.created_at,
             "messages": messages_json,
         }
 
@@ -57,6 +69,11 @@ class SessionStore:
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        # Registry of in-flight tasks per session_id. Background launches
+        # store their asyncio.Task here so callers can detect "busy"
+        # sessions and reject resume attempts without blocking on the lock.
+        # Tasks remove themselves via add_done_callback when they complete.
+        self._tasks: dict[str, asyncio.Task[Any]] = {}
 
     def _session_path(self, session_id: str) -> Path:
         return self.session_dir / f"{session_id}.json"
@@ -88,11 +105,13 @@ class SessionStore:
     def create(self, skill_name: str, model: str) -> Session:
         """Create a new session with a fresh UUID."""
         session_id = str(uuid.uuid4())
+        now = datetime.now(UTC).isoformat()
         session = Session(
             session_id=session_id,
             skill_name=skill_name,
             model=model,
-            created_at=datetime.now(UTC).isoformat(),
+            created_at=now,
+            last_active=now,
         )
         self._sessions[session_id] = session
         self._persist(session)
@@ -109,12 +128,17 @@ class SessionStore:
         messages = ModelMessagesTypeAdapter.validate_python(
             data.get("messages", [])
         )
+        # status/last_active may be absent in pre-Phase-2 session files;
+        # default to idle and the creation timestamp so old sessions load.
+        status: SessionStatus = data.get("status", "idle")
         session = Session(
             session_id=data["session_id"],
             skill_name=data["skill_name"],
             model=data["model"],
             created_at=data["created_at"],
             messages=messages,
+            status=status,
+            last_active=data.get("last_active", data["created_at"]),
         )
         self._sessions[session_id] = session
         return session
@@ -130,11 +154,46 @@ class SessionStore:
                     "skill_name": data["skill_name"],
                     "model": data["model"],
                     "created_at": data["created_at"],
+                    "status": data.get("status", "idle"),
+                    "last_active": data.get("last_active", data["created_at"]),
                     "message_count": len(data.get("messages", [])),
                 })
             except (json.JSONDecodeError, KeyError):
                 continue
         return sessions
+
+    # -- task registry (for run_in_background) --
+
+    def register_task(
+        self, session_id: str, task: asyncio.Task[Any]
+    ) -> None:
+        """Track a background task for a session.
+
+        The task removes itself via ``add_done_callback`` when complete,
+        so the registry stays bounded by the number of in-flight runs.
+        """
+        self._tasks[session_id] = task
+        task.add_done_callback(lambda _t: self._tasks.pop(session_id, None))
+
+    def is_running(self, session_id: str) -> bool:
+        """Return True if a tracked task for this session is still in flight.
+
+        Used by callers to fail-fast on resume attempts against a busy
+        session without blocking on the per-session lock. Phase 5 will
+        replace this fail-fast with a proper mailbox queue.
+        """
+        task = self._tasks.get(session_id)
+        return task is not None and not task.done()
+
+    def touch(self, session_id: str) -> None:
+        """Bump ``last_active`` to now for an in-cache session.
+
+        No-op if the session is not in cache. Does not persist on its
+        own; the next ``save`` writes the new value to disk.
+        """
+        session = self._sessions.get(session_id)
+        if session is not None:
+            session.last_active = datetime.now(UTC).isoformat()
 
     def _persist(self, session: Session) -> None:
         """Atomically write session to disk via tempfile + ``os.replace``.
