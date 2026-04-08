@@ -4,8 +4,13 @@
 
 <!-- bump: patch -->
 
+### Changed
+
+- Document mid-stream staleness of `get_session_transcript` in `docs/DESIGN.md`; cross-link `get_session_transcript` and `tail_session_log` MCP tool descriptions so LLM callers pick the right one (#9).
+
 ### Added
 
+- Per-turn completion trailer (`--- end ok ---` / `--- end error ---` / `--- end cancelled ---`) on streaming session logs so tail clients can detect completion, errors, and client-disconnect cancellation (#8).
 - Streaming skill execution via `agent.run_stream()`, gated by a new `streaming: bool` config field (default `true`) with `SUBAGENT_MCP_STREAMING` env override
 - Per-session append-only `{session_dir}/{session_id}.log` files capturing text deltas with a `--- prompt ---` / `--- response ---` transcript format
 - New `tail_session_log(session_id, offset)` MCP tool for offset-based polling of live stream output

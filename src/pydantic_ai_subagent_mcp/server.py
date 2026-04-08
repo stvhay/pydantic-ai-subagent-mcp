@@ -8,7 +8,7 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TextIO
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -96,6 +96,38 @@ def _build_agent(skill: Skill, model_name: str | None = None) -> Agent[None, str
     )
 
 
+def _write_trailer(
+    log: TextIO,
+    status: str,
+    exc: BaseException | None = None,
+) -> None:
+    """Best-effort write of a single-line completion trailer to the streaming log.
+
+    Any I/O failure is swallowed via the module logger so the caller's
+    original exception (if any) propagates unmasked. If ``exc`` is None,
+    writes ``--- end {status} {iso_ts} ---``; otherwise appends
+    ``: {ExceptionType}: {sanitized message}``. Newlines and carriage
+    returns in the exception message are replaced with spaces so the
+    trailer is always one line. ``str(exc)`` is itself wrapped in a
+    try/except in case ``__str__`` raises.
+    """
+    try:
+        ts = datetime.now(UTC).isoformat()
+        if exc is None:
+            log.write(f"\n--- end {status} {ts} ---\n")
+        else:
+            try:
+                detail = str(exc).replace("\n", " ").replace("\r", " ")
+            except Exception:  # noqa: BLE001 — defensive: __str__ may raise
+                detail = "<unprintable>"
+            log.write(
+                f"\n--- end {status} {ts}: {type(exc).__name__}: {detail} ---\n"
+            )
+        log.flush()
+    except Exception:  # noqa: BLE001 — best-effort; never mask caller's exception
+        logger.exception("failed to write streaming log %s trailer", status)
+
+
 async def _run_skill_streaming(
     agent: Agent[None, str],
     prompt: str,
@@ -109,6 +141,17 @@ async def _run_skill_streaming(
     then streams text deltas from ``agent.run_stream()`` to the file with
     per-chunk flush so concurrent tail readers see output in real time.
 
+    Each turn is terminated by a trailer line so tail clients can detect
+    completion: ``--- end ok {iso_ts} ---`` on success,
+    ``--- end error {iso_ts}: {ExceptionType}: {message} ---`` on failure
+    (any ``Exception`` escaping ``run_stream``/``stream_text``), or
+    ``--- end cancelled {iso_ts}: {ExceptionType}: {message} ---`` on
+    cancellation (``CancelledError`` from a client disconnect, or any
+    other ``BaseException`` like ``KeyboardInterrupt``/``SystemExit``).
+    Trailer writes are best-effort and never mask the original exception:
+    if the trailer write itself fails, the failure is logged but the
+    caller's exception is what propagates.
+
     Returns ``(final_output, all_messages)``.
     """
     log_path = store.log_path(session.session_id)
@@ -119,15 +162,28 @@ async def _run_skill_streaming(
     with log_path.open("a", encoding="utf-8") as log:
         log.write(header)
         log.flush()
-        async with agent.run_stream(
-            prompt,
-            message_history=session.messages or None,
-        ) as result:
-            async for chunk in result.stream_text(delta=True):
-                log.write(chunk)
-                log.flush()
-            output = await result.get_output()
-            messages = result.all_messages()
+        try:
+            async with agent.run_stream(
+                prompt,
+                message_history=session.messages or None,
+            ) as result:
+                async for chunk in result.stream_text(delta=True):
+                    log.write(chunk)
+                    log.flush()
+                output = await result.get_output()
+                messages = result.all_messages()
+        except Exception as e:
+            _write_trailer(log, "error", e)
+            raise
+        except BaseException as e:
+            # Catches CancelledError (client disconnect), KeyboardInterrupt,
+            # SystemExit, GeneratorExit. Write a distinct trailer so tail
+            # clients can distinguish cancellation from normal completion or
+            # error, then re-raise so the runtime tears down cleanly.
+            _write_trailer(log, "cancelled", e)
+            raise
+        else:
+            _write_trailer(log, "ok", None)
     return output, messages
 
 
@@ -220,7 +276,12 @@ async def list_sessions() -> str:
 
 @mcp_server.tool(
     name="get_session_transcript",
-    description="Get the full transcript of a session by its UUID.",
+    description=(
+        "Get the full structured transcript of a session by its UUID. "
+        "During an active streaming run the in-flight turn is not yet visible "
+        "(the session is only persisted after the stream completes) "
+        "-- use tail_session_log to observe in-progress output."
+    ),
 )
 async def get_session_transcript(session_id: str) -> str:
     store = _get_session_store()
@@ -244,7 +305,9 @@ async def list_available_skills() -> str:
         "Read new output from a running (or completed) session log. "
         "Pass offset=0 for the first call, then feed back the returned "
         "next_offset to poll for new content. Returns JSON with "
-        "session_id, text, and next_offset."
+        "session_id, text (raw stream output), and next_offset. For the "
+        "structured pydantic-ai message history of completed turns, use "
+        "get_session_transcript."
     ),
 )
 async def tail_session_log(session_id: str, offset: int = 0) -> str:
