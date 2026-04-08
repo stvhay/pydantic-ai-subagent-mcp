@@ -82,6 +82,15 @@ Properties of the hook:
 
 If your inbox lives outside the project root, set `SUBAGENT_MCP_INBOX_DIR` in the hook environment.
 
+### Backpressure
+
+Two independent caps protect the server from runaway producers:
+
+- **`max_concurrent_runs`** (default `4`) — server-wide ceiling on the number of in-flight skill turns across all sessions. Background launches that arrive while the gate is fully held return `status: "saturated"` immediately so the caller can react. Foreground launches always enqueue and end up waiting on the gate inside the worker (the natural Ask-mode behavior).
+- **`mailbox_max_depth`** (default `16`) — per-session ceiling on queued items waiting behind the in-flight turn. A push that would exceed the cap returns `status: "mailbox_full"` regardless of mode, so foreground callers cannot bypass the cap by simply omitting `run_in_background`.
+
+Both knobs can be set in `.subagent-mcp.json` or overridden by `SUBAGENT_MCP_MAX_CONCURRENT_RUNS` and `SUBAGENT_MCP_MAILBOX_MAX_DEPTH`. Non-positive or unparseable values silently fall back to the defaults (a misconfigured backpressure knob must never crash the server at boot).
+
 ## Development
 
 ```bash

@@ -21,6 +21,19 @@ class ServerConfig:
     tool_timeout: float = 120.0
     srclight_enabled: bool = True
     streaming: bool = True
+    # Backpressure: server-wide cap on in-flight skill turns. The
+    # session worker acquires a slot before running its turn and
+    # releases on exit. Background launches that arrive while the
+    # semaphore is fully held are rejected with status="saturated".
+    # Foreground launches enqueue normally and end up waiting on the
+    # semaphore inside the worker.
+    max_concurrent_runs: int = 4
+    # Backpressure: per-session cap on the number of items the
+    # mailbox will hold. Pushes that would push the depth above this
+    # cap are rejected with status="mailbox_full" -- regardless of
+    # foreground/background -- so a runaway producer cannot grow a
+    # session's queue without bound.
+    mailbox_max_depth: int = 16
     extra_env: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -40,6 +53,20 @@ class ServerConfig:
         if streaming_env is not None:
             streaming_default = streaming_env.strip().lower() in ("1", "true", "yes")
 
+        # Backpressure knobs: env overrides config file overrides class default.
+        # Both must be positive ints; non-positive or unparseable values fall
+        # back to the class default rather than crashing the server at boot.
+        max_concurrent = _positive_int_env(
+            "SUBAGENT_MCP_MAX_CONCURRENT_RUNS",
+            data.get("max_concurrent_runs", cls.max_concurrent_runs),
+            cls.max_concurrent_runs,
+        )
+        mailbox_max = _positive_int_env(
+            "SUBAGENT_MCP_MAILBOX_MAX_DEPTH",
+            data.get("mailbox_max_depth", cls.mailbox_max_depth),
+            cls.mailbox_max_depth,
+        )
+
         # Environment overrides take precedence
         return cls(
             ollama_base_url=os.environ.get(
@@ -55,5 +82,33 @@ class ServerConfig:
             tool_timeout=float(data.get("tool_timeout", cls.tool_timeout)),
             srclight_enabled=data.get("srclight_enabled", cls.srclight_enabled),
             streaming=streaming_default,
+            max_concurrent_runs=max_concurrent,
+            mailbox_max_depth=mailbox_max,
             extra_env=data.get("extra_env", {}),
         )
+
+
+def _positive_int_env(env_var: str, file_value: Any, default: int) -> int:
+    """Resolve a positive-int knob from env / config file / default.
+
+    Precedence: ``$env_var`` > ``file_value`` > ``default``. The result
+    must be a positive integer; any non-positive or unparseable value
+    silently falls through to the next layer. Backpressure caps must
+    never be zero (would deadlock the server) and the server must
+    never crash at boot because of a bad config value.
+    """
+    raw = os.environ.get(env_var)
+    if raw is not None:
+        try:
+            parsed = int(raw)
+            if parsed > 0:
+                return parsed
+        except ValueError:
+            pass
+    try:
+        parsed = int(file_value)
+        if parsed > 0:
+            return parsed
+    except (TypeError, ValueError):
+        pass
+    return default

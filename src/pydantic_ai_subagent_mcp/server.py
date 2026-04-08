@@ -32,6 +32,12 @@ _config: ServerConfig | None = None
 _session_store: SessionStore | None = None
 _inbox: Inbox | None = None
 _skills: list[Skill] = []
+# Server-wide concurrency gate. Bounds the number of in-flight
+# ``_execute_skill_turn`` calls across *all* sessions, so a swarm of
+# background launches cannot saturate the host. Created lazily on
+# first access to bind to the running event loop (asyncio.Semaphore
+# remembers which loop it was constructed on).
+_run_semaphore: asyncio.Semaphore | None = None
 
 
 @asynccontextmanager
@@ -71,6 +77,20 @@ def _get_inbox() -> Inbox:
     if _inbox is None:
         _inbox = Inbox(_get_config().inbox_dir)
     return _inbox
+
+
+def _get_run_semaphore() -> asyncio.Semaphore:
+    """Lazily build the server-wide concurrency gate.
+
+    The semaphore is created on first access so it binds to the
+    running event loop. ``asyncio.Semaphore`` is loop-affine; building
+    it eagerly at import or in ``_initialize`` would crash any test
+    that runs in a fresh loop.
+    """
+    global _run_semaphore
+    if _run_semaphore is None:
+        _run_semaphore = asyncio.Semaphore(_get_config().max_concurrent_runs)
+    return _run_semaphore
 
 
 def _build_model(model_name: str | None = None) -> OpenAIChatModel:
@@ -372,9 +392,14 @@ async def _session_worker(session_id: str) -> None:
                 continue
 
             try:
-                result = await _execute_skill_turn(
-                    item.skill, item.prompt, session, item.model
-                )
+                # Server-wide concurrency gate. The worker holds the
+                # slot only for the duration of the actual turn so
+                # mailbox queueing is unaffected: the slot is bound
+                # to in-flight execution, not to admission.
+                async with _get_run_semaphore():
+                    result = await _execute_skill_turn(
+                        item.skill, item.prompt, session, item.model
+                    )
             except BaseException as e:
                 # _execute_skill_turn caught Exception and returned a
                 # dict with "error", so we only land here on
@@ -423,6 +448,20 @@ async def _run_skill(
     ``status="skill_mismatch"`` -- sessions are bound to a skill at
     creation and the message history would be incoherent under
     a different skill's system prompt.
+
+    Backpressure -- two independent rejection paths protect the
+    server from a runaway producer:
+
+    * ``status="mailbox_full"`` (both modes) -- the per-session
+      mailbox already holds ``mailbox_max_depth`` items. Rejection
+      is the same for foreground and background so foreground
+      callers cannot bypass the cap by simply not passing
+      ``run_in_background=True``.
+    * ``status="saturated"`` (background only) -- the server-wide
+      run semaphore is fully held. Background launches return
+      immediately so the caller can react; foreground launches
+      enqueue normally and end up waiting on the semaphore inside
+      the worker, which is the natural Ask-mode behavior.
     """
     store = _get_session_store()
     config = _get_config()
@@ -445,6 +484,49 @@ async def _run_skill(
             "error": (
                 f"session {session.session_id} is bound to skill "
                 f"'{session.skill_name}', cannot resume with '{skill.name}'"
+            ),
+        }
+
+    # Per-session mailbox cap. Hard rejection regardless of mode --
+    # foreground callers must not be able to bypass the cap by
+    # simply omitting run_in_background. Note this counts queued
+    # items only (mailbox_depth excludes the in-flight one), so the
+    # effective concurrent backlog per session is mailbox_max_depth + 1.
+    current_depth = store.mailbox_depth(session.session_id)
+    if current_depth >= config.mailbox_max_depth:
+        return {
+            "session_id": session.session_id,
+            "status": "mailbox_full",
+            "skill": skill.name,
+            "model": session.model,
+            "mailbox_depth": current_depth,
+            "mailbox_max_depth": config.mailbox_max_depth,
+            "error": (
+                f"session {session.session_id} mailbox is full "
+                f"({current_depth}/{config.mailbox_max_depth}); "
+                "retry after the worker drains some pending items"
+            ),
+        }
+
+    # Server-wide saturation check (background only). Foreground
+    # callers always enqueue and end up waiting on the semaphore
+    # inside the worker -- that is the natural Ask-mode behavior
+    # and matches the contract that foreground = "wait until done".
+    # The check is best-effort: between this snapshot and the
+    # worker's actual semaphore acquire a slot may free up, in
+    # which case we reject pessimistically. That is the right side
+    # to err on for backpressure.
+    if run_in_background and _get_run_semaphore().locked():
+        return {
+            "session_id": session.session_id,
+            "status": "saturated",
+            "skill": skill.name,
+            "model": session.model,
+            "max_concurrent_runs": config.max_concurrent_runs,
+            "error": (
+                f"server is at capacity ({config.max_concurrent_runs} "
+                "concurrent runs); retry shortly or run in foreground "
+                "to wait for a slot"
             ),
         }
 
@@ -601,9 +683,13 @@ async def read_inbox(since: str = "", limit: int = 50) -> str:
         "status is 'running' if the turn starts processing right away or "
         "'queued' if it lands behind in-flight work. Resuming a busy session "
         "enqueues the new prompt rather than rejecting it, preserving FIFO "
-        "order. Poll tail_session_log for live output and get_session_transcript "
-        "once the turn completes; or wire scripts/notification-hook.sh to "
-        "receive completion notifications via UserPromptSubmit."
+        "order. Backpressure: a push that would exceed the per-session "
+        "mailbox cap returns status='mailbox_full'; a background launch "
+        "that hits the server-wide concurrency cap returns status='saturated' "
+        "(foreground launches block waiting for a slot). Poll tail_session_log "
+        "for live output and get_session_transcript once the turn completes; "
+        "or wire scripts/notification-hook.sh to receive completion "
+        "notifications via UserPromptSubmit."
     ),
 )
 async def run_skill_by_name(
@@ -642,11 +728,14 @@ async def _check_ollama(config: ServerConfig) -> None:
 
 def _initialize() -> None:
     """Discover skills and register them as MCP tools at startup."""
-    global _skills, _config, _session_store, _inbox
+    global _skills, _config, _session_store, _inbox, _run_semaphore
 
     _config = ServerConfig.load()
     _session_store = SessionStore(_config.session_dir)
     _inbox = Inbox(_config.inbox_dir)
+    # Reset to None so the semaphore is rebuilt on first use under
+    # the running event loop (asyncio.Semaphore is loop-affine).
+    _run_semaphore = None
 
     logger.info("Discovering skills...")
     _skills = discover_skills()
