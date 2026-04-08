@@ -7,6 +7,7 @@ import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import TracebackType
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -21,20 +22,37 @@ from pydantic_ai.messages import (
 from pydantic_ai_subagent_mcp import server
 from pydantic_ai_subagent_mcp.config import ServerConfig
 from pydantic_ai_subagent_mcp.skills import Skill
+from tests._helpers import yield_until
 
 
 @pytest.fixture(autouse=True)
-def _reset_server_globals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Reset server module globals between tests."""
+async def _reset_server_globals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[None]:
+    """Reset server module globals between tests.
+
+    Async fixture so the teardown can ``await`` the SessionStore's
+    shutdown -- per-session worker tasks block on ``mailbox.get()``
+    between items, and leaving them dangling would emit "Task was
+    destroyed but it is pending!" warnings (and bleed across tests
+    that share the same module-level singletons).
+    """
     monkeypatch.delenv("SUBAGENT_MCP_DEFAULT_MODEL", raising=False)
     monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
     monkeypatch.delenv("SUBAGENT_MCP_STREAMING", raising=False)
+    monkeypatch.delenv("SUBAGENT_MCP_MAX_CONCURRENT_RUNS", raising=False)
+    monkeypatch.delenv("SUBAGENT_MCP_MAILBOX_MAX_DEPTH", raising=False)
     server._config = ServerConfig(
         session_dir=str(tmp_path / "sessions"),
+        inbox_dir=str(tmp_path / "inbox"),
         streaming=False,
     )
     server._session_store = None
+    server._inbox = None
     server._skills = []
+    yield
+    if server._session_store is not None:
+        await server._session_store.shutdown()
 
 
 def _make_skill(tmp_path: Path, name: str = "test-skill") -> Skill:
@@ -42,6 +60,25 @@ def _make_skill(tmp_path: Path, name: str = "test-skill") -> Skill:
     md = tmp_path / f"{name}.md"
     md.write_text(f"# {name}\n\nA test skill.\n")
     return Skill(name=name, description="A test skill", source_path=md)
+
+
+def _override_streaming_config(tmp_path: Path) -> None:
+    """Switch the server config into streaming mode for one test.
+
+    Resets every server-level singleton (config, session store, inbox)
+    so each call yields a fresh, fully isolated state pointed at
+    ``tmp_path``. Tests that need streaming mode should call this in
+    place of mutating ``server._config`` directly — without resetting
+    ``_inbox``, completion notifications would leak into the real
+    ``.subagent-inbox/`` directory in the project root.
+    """
+    server._config = ServerConfig(
+        session_dir=str(tmp_path / "sessions"),
+        inbox_dir=str(tmp_path / "inbox"),
+        streaming=True,
+    )
+    server._session_store = None
+    server._inbox = None
 
 
 def _make_mock_result(output: str = "Hello from the agent!") -> MagicMock:
@@ -361,11 +398,7 @@ def _make_queue_stream(
 
 async def test_run_skill_streaming_writes_log(tmp_path: Path) -> None:
     """With streaming=True, _run_skill writes deltas to the session log file."""
-    server._config = ServerConfig(
-        session_dir=str(tmp_path / "sessions"),
-        streaming=True,
-    )
-    server._session_store = None  # force rebuild with new config
+    _override_streaming_config(tmp_path)
 
     skill = _make_skill(tmp_path)
     chunks = ["Hello", " from", " the", " agent!"]
@@ -396,11 +429,7 @@ async def test_run_skill_streaming_writes_log(tmp_path: Path) -> None:
 
 async def test_run_skill_streaming_multi_turn_appends(tmp_path: Path) -> None:
     """Each turn appends a new prompt/response block to the same log."""
-    server._config = ServerConfig(
-        session_dir=str(tmp_path / "sessions"),
-        streaming=True,
-    )
-    server._session_store = None
+    _override_streaming_config(tmp_path)
 
     skill = _make_skill(tmp_path)
 
@@ -459,11 +488,7 @@ async def test_run_skill_streaming_writes_ok_trailer(tmp_path: Path) -> None:
 
     Tests issue #8 acceptance criterion 1.
     """
-    server._config = ServerConfig(
-        session_dir=str(tmp_path / "sessions"),
-        streaming=True,
-    )
-    server._session_store = None  # force rebuild with new config
+    _override_streaming_config(tmp_path)
 
     skill = _make_skill(tmp_path)
     chunks = ["Hello", " world"]
@@ -495,11 +520,7 @@ async def test_run_skill_streaming_writes_error_trailer_and_propagates(
     The exception surfaces via _run_skill's error response.
     Tests issue #8 acceptance criterion 2.
     """
-    server._config = ServerConfig(
-        session_dir=str(tmp_path / "sessions"),
-        streaming=True,
-    )
-    server._session_store = None
+    _override_streaming_config(tmp_path)
 
     skill = _make_skill(tmp_path)
     boom = RuntimeError("ollama vanished")
@@ -534,11 +555,7 @@ async def test_run_skill_streaming_error_trailer_sanitizes_newlines(
 
     Ensures the trailer stays on a single line.
     """
-    server._config = ServerConfig(
-        session_dir=str(tmp_path / "sessions"),
-        streaming=True,
-    )
-    server._session_store = None
+    _override_streaming_config(tmp_path)
 
     skill = _make_skill(tmp_path)
     boom = ValueError("line one\nline two\rline three")
@@ -574,11 +591,7 @@ async def test_run_skill_streaming_cancelled_writes_cancelled_trailer(
     so it propagates past _run_skill's outer error handler. The trailer must
     still be written before the exception escapes _run_skill_streaming.
     """
-    server._config = ServerConfig(
-        session_dir=str(tmp_path / "sessions"),
-        streaming=True,
-    )
-    server._session_store = None
+    _override_streaming_config(tmp_path)
 
     skill = _make_skill(tmp_path)
     cancelled = asyncio.CancelledError()
@@ -787,3 +800,1154 @@ async def test_tail_session_log_tool_nonexistent() -> None:
     result = json.loads(result_json)
     assert result["text"] == ""
     assert result["next_offset"] == 0
+
+
+# -- Phase 2: background execution, status transitions, busy reject --
+
+
+async def test_run_skill_status_transitions_idle_to_idle(tmp_path: Path) -> None:
+    """A successful foreground run leaves the session idle and bumps last_active."""
+    skill = _make_skill(tmp_path)
+    mock_result = _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=mock_result)
+        mock_build.return_value = mock_agent
+
+        result = await server._run_skill(skill, "say hello")
+
+    assert result["status"] == "idle"
+    store = server._get_session_store()
+    session = store.get(result["session_id"])
+    assert session is not None
+    assert session.status == "idle"
+    # last_active should have advanced past created_at after the turn
+    assert session.last_active >= session.created_at
+
+
+async def test_run_skill_status_transitions_to_failed_on_error(
+    tmp_path: Path,
+) -> None:
+    """An exception during the agent call leaves the session in 'failed'."""
+    skill = _make_skill(tmp_path)
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=RuntimeError("ollama down"))
+        mock_build.return_value = mock_agent
+
+        result = await server._run_skill(skill, "say hello")
+
+    assert "error" in result
+    assert result["status"] == "failed"
+    store = server._get_session_store()
+    session = store.get(result["session_id"])
+    assert session is not None
+    assert session.status == "failed"
+
+
+async def test_run_skill_persists_running_status_during_turn(
+    tmp_path: Path,
+) -> None:
+    """While the agent call is in flight, the on-disk status reads 'running'.
+
+    Verifies that observers reading list_sessions or session JSON during a
+    turn see the in-flight state, not the stale prior status.
+    """
+    skill = _make_skill(tmp_path)
+    store = server._get_session_store()
+    observed: dict[str, str] = {}
+
+    async def slow_run(*_a: object, **_k: object) -> MagicMock:
+        # Read the on-disk session JSON from inside the agent call to
+        # verify it shows status=running
+        sessions = store.list_sessions()
+        observed["status"] = sessions[0]["status"]
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=slow_run)
+        mock_build.return_value = mock_agent
+
+        await server._run_skill(skill, "go")
+
+    assert observed["status"] == "running"
+
+
+async def test_run_skill_background_returns_immediately(tmp_path: Path) -> None:
+    """A background launch returns before the agent call resolves."""
+    skill = _make_skill(tmp_path)
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result("background done")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        # The background launch must return promptly even though the agent
+        # call is still blocked. Bound it with wait_for so a regression
+        # would fail with TimeoutError instead of hanging the suite.
+        result = await asyncio.wait_for(
+            server._run_skill(skill, "go", run_in_background=True),
+            timeout=1.0,
+        )
+
+        assert result["status"] == "running"
+        assert "session_id" in result
+        assert "log_path" in result
+        assert "mailbox_depth" in result
+        assert "response" not in result  # response only on completion
+        session_id = result["session_id"]
+
+        # The store should have a worker drain the mailbox
+        store = server._get_session_store()
+        assert store.has_worker(session_id) is True
+
+        # Let the worker finish processing this item
+        can_finish.set()
+        await asyncio.wait_for(store.drain(session_id), timeout=1.0)
+
+        session = store.get(session_id)
+        assert session is not None
+        assert session.status == "idle"
+        # The completed run wrote messages back to the session
+        assert len(session.messages) == 2
+
+
+async def test_run_skill_resume_after_completion_succeeds(tmp_path: Path) -> None:
+    """Once the in-flight item completes, the session is resumable again."""
+    skill = _make_skill(tmp_path)
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(
+            side_effect=[_make_mock_result("one"), _make_mock_result("two")]
+        )
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(
+            skill, "first", run_in_background=True
+        )
+        session_id = first["session_id"]
+
+        # Drain the background work
+        store = server._get_session_store()
+        await asyncio.wait_for(store.drain(session_id), timeout=1.0)
+
+        # Now a resume should succeed (foreground)
+        second = await server._run_skill(
+            skill, "second", session_id=session_id
+        )
+        assert second["status"] == "idle"
+        assert second["session_id"] == session_id
+        assert second["response"] == "two"
+
+
+async def test_run_skill_by_name_background(tmp_path: Path) -> None:
+    """The MCP tool wrapper passes run_in_background through correctly."""
+    skill = _make_skill(tmp_path)
+    server._skills = [skill]
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        result_json = await asyncio.wait_for(
+            server.run_skill_by_name(
+                skill.name, "go", run_in_background=True
+            ),
+            timeout=1.0,
+        )
+        result = json.loads(result_json)
+        assert result["status"] == "running"
+
+        # Drain
+        can_finish.set()
+        store = server._get_session_store()
+        await asyncio.wait_for(
+            store.drain(result["session_id"]), timeout=1.0
+        )
+
+
+async def test_list_sessions_tool_exposes_status(tmp_path: Path) -> None:
+    """The list_sessions MCP tool surfaces the new status/last_active fields."""
+    store = server._get_session_store()
+    s = store.create("skill-a", "gemma4:12b")
+    s.status = "running"
+    s.last_active = "2026-04-08T10:00:00+00:00"
+    store.save(s)
+
+    result_json = await server.list_sessions()
+    result = json.loads(result_json)
+    assert len(result) == 1
+    assert result[0]["status"] == "running"
+    assert result[0]["last_active"] == "2026-04-08T10:00:00+00:00"
+
+
+# -- Phase 3: inbox notifications + read_inbox tool --
+
+
+async def test_run_skill_emits_ok_notification_on_success(tmp_path: Path) -> None:
+    """A successful turn writes an 'ok' notification with the response summary."""
+    skill = _make_skill(tmp_path)
+    mock_result = _make_mock_result("agent said hi")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=mock_result)
+        mock_build.return_value = mock_agent
+
+        result = await server._run_skill(skill, "hello")
+
+    inbox = server._get_inbox()
+    notifications, _ = inbox.read(since="")
+    assert len(notifications) == 1
+    n = notifications[0]
+    assert n["session_id"] == result["session_id"]
+    assert n["status"] == "ok"
+    assert n["skill"] == skill.name
+    assert n["summary"] == "agent said hi"
+
+
+async def test_run_skill_emits_error_notification_on_exception(
+    tmp_path: Path,
+) -> None:
+    """An exception during the turn writes an 'error' notification."""
+    skill = _make_skill(tmp_path)
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=RuntimeError("boom"))
+        mock_build.return_value = mock_agent
+
+        result = await server._run_skill(skill, "hello")
+
+    inbox = server._get_inbox()
+    notifications, _ = inbox.read(since="")
+    assert len(notifications) == 1
+    n = notifications[0]
+    assert n["session_id"] == result["session_id"]
+    assert n["status"] == "error"
+    assert "boom" in n["summary"]
+
+
+async def test_run_skill_emits_cancelled_notification_on_basexception(
+    tmp_path: Path,
+) -> None:
+    """CancelledError writes a 'cancelled' notification before propagating.
+
+    Streaming mode is required to trigger the BaseException path
+    (CancelledError raised mid-stream — see existing test for the
+    cancelled trailer behavior).
+    """
+    _override_streaming_config(tmp_path)
+
+    skill = _make_skill(tmp_path)
+    cancelled = asyncio.CancelledError()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = MagicMock()
+        mock_agent.run_stream = MagicMock(
+            return_value=_make_failing_stream(["partial"], cancelled)
+        )
+        mock_build.return_value = mock_agent
+
+        with pytest.raises(asyncio.CancelledError):
+            await server._run_skill(skill, "go")
+
+    inbox = server._get_inbox()
+    notifications, _ = inbox.read(since="")
+    assert len(notifications) == 1
+    n = notifications[0]
+    assert n["status"] == "cancelled"
+    assert "CancelledError" in n["summary"]
+
+
+async def test_inbox_write_failure_does_not_mask_run_result(
+    tmp_path: Path,
+) -> None:
+    """If the inbox write itself raises, the run still returns its response."""
+    skill = _make_skill(tmp_path)
+    mock_result = _make_mock_result("agent succeeded")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=mock_result)
+        mock_build.return_value = mock_agent
+
+        # Make Inbox.write raise unconditionally
+        def boom(*args: object, **kwargs: object) -> None:
+            raise OSError("inbox volume full")
+
+        with patch.object(server._get_inbox(), "write", side_effect=boom):
+            result = await server._run_skill(skill, "go")
+
+    # The agent's response is preserved despite the inbox failure
+    assert "error" not in result
+    assert result["response"] == "agent succeeded"
+    assert result["status"] == "idle"
+
+
+async def test_run_skill_background_emits_notification_on_completion(
+    tmp_path: Path,
+) -> None:
+    """A background run still writes a notification when its task finishes."""
+    skill = _make_skill(tmp_path)
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result("background ok")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        session_id = first["session_id"]
+        assert first["status"] == "running"
+
+        # Inbox is empty until the background task completes
+        inbox = server._get_inbox()
+        notifications, _ = inbox.read(since="")
+        assert notifications == []
+
+        can_finish.set()
+        store = server._get_session_store()
+        await asyncio.wait_for(store.drain(session_id), timeout=1.0)
+
+        notifications, _ = inbox.read(since="")
+        assert len(notifications) == 1
+        assert notifications[0]["status"] == "ok"
+        assert notifications[0]["session_id"] == session_id
+        assert notifications[0]["summary"] == "background ok"
+
+
+async def test_read_inbox_tool_returns_records_and_head(tmp_path: Path) -> None:
+    """read_inbox MCP tool returns the {notifications, head} JSON shape."""
+    inbox = server._get_inbox()
+    n = inbox.write(
+        session_id="s1",
+        skill="skill",
+        model="m",
+        status="ok",
+        summary="hello",
+    )
+
+    result_json = await server.read_inbox()
+    result = json.loads(result_json)
+    assert "notifications" in result
+    assert "head" in result
+    assert len(result["notifications"]) == 1
+    assert result["notifications"][0]["notification_id"] == n.notification_id
+    assert result["head"] == n.notification_id
+
+
+async def test_read_inbox_tool_advances_with_cursor(tmp_path: Path) -> None:
+    """Passing the previous head as 'since' returns only newer records."""
+    inbox = server._get_inbox()
+    first = inbox.write(
+        session_id="s1", skill="k", model="m", status="ok", summary="one"
+    )
+
+    initial = json.loads(await server.read_inbox(since=""))
+    assert initial["head"] == first.notification_id
+
+    # No new records yet — cursor should not advance
+    second = json.loads(await server.read_inbox(since=initial["head"]))
+    assert second["notifications"] == []
+    assert second["head"] == initial["head"]
+
+    # Write more, then drain forward
+    second_n = inbox.write(
+        session_id="s2", skill="k", model="m", status="error", summary="boom"
+    )
+    third = json.loads(await server.read_inbox(since=initial["head"]))
+    assert len(third["notifications"]) == 1
+    assert third["notifications"][0]["notification_id"] == second_n.notification_id
+    assert third["head"] == second_n.notification_id
+
+
+async def test_read_inbox_tool_empty_inbox(tmp_path: Path) -> None:
+    """read_inbox on an empty inbox returns empty notifications and empty head."""
+    result = json.loads(await server.read_inbox())
+    assert result["notifications"] == []
+    assert result["head"] == ""
+
+
+# -- Phase 5: per-session mailbox queue + worker --
+
+
+async def test_resume_busy_session_enqueues_and_runs_in_order(
+    tmp_path: Path,
+) -> None:
+    """Two background pushes to the same session run FIFO without rejection.
+
+    The second push must NOT return status='busy' (Phase 2 behavior);
+    it must enqueue and the worker must process both items in order.
+    The session's message history is the ground truth for ordering.
+    """
+    skill = _make_skill(tmp_path)
+    can_finish_first = asyncio.Event()
+    call_order: list[str] = []
+
+    async def staged_run(*args: Any, **kwargs: Any) -> MagicMock:
+        # First call records "first-start" then waits for the gate.
+        # Second call records "second-start" and returns immediately.
+        history = kwargs.get("message_history") or []
+        label = "first" if not history else "second"
+        call_order.append(f"{label}-start")
+        if label == "first":
+            await can_finish_first.wait()
+        return _make_mock_result(f"{label}-done")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=staged_run)
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        sid = first["session_id"]
+        # First item should be running (mailbox was empty before push)
+        assert first["status"] == "running"
+
+        # Wait until the worker has picked up the first item and is
+        # blocked inside the slow agent call.
+        await yield_until(
+            lambda: "first-start" in call_order,
+            description="worker enters first agent call",
+        )
+
+        # Second push must enqueue, not be rejected
+        second = await server._run_skill(
+            skill, "again", session_id=sid, run_in_background=True
+        )
+        assert second["status"] == "queued"
+        assert second["session_id"] == sid
+        assert second["mailbox_depth"] == 1  # one item waiting behind the inflight
+
+        # Release the first item; both should drain in order
+        can_finish_first.set()
+        store = server._get_session_store()
+        await asyncio.wait_for(store.drain(sid), timeout=1.0)
+
+        # FIFO ordering invariant: the worker processed first then second.
+        # (The mock's all_messages() returns a fresh pair on each call so
+        # we can't introspect the cumulative history; call_order is the
+        # ground truth for ordering.)
+        assert call_order == ["first-start", "second-start"]
+        session = store.get(sid)
+        assert session is not None
+        assert session.status == "idle"
+        # mailbox is fully drained
+        assert store.mailbox_depth(sid) == 0
+
+
+async def test_foreground_resume_blocks_until_its_turn(tmp_path: Path) -> None:
+    """A foreground resume on a busy session waits for its enqueued item."""
+    skill = _make_skill(tmp_path)
+    can_finish_first = asyncio.Event()
+
+    async def staged_run(*args: Any, **kwargs: Any) -> MagicMock:
+        history = kwargs.get("message_history") or []
+        if not history:
+            await can_finish_first.wait()
+            return _make_mock_result("first-done")
+        return _make_mock_result("second-done")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=staged_run)
+        mock_build.return_value = mock_agent
+
+        # Background run holds the worker
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        sid = first["session_id"]
+
+        # Foreground resume must enqueue and wait, not return immediately.
+        # We start it as a task so we can verify it's pending.
+        fg_task = asyncio.create_task(
+            server._run_skill(skill, "again", session_id=sid)
+        )
+        # Give the event loop a few ticks; the foreground task should
+        # still be pending because the first item is blocking the worker.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not fg_task.done()
+
+        # Release the first; foreground should now complete with its result
+        can_finish_first.set()
+        result = await asyncio.wait_for(fg_task, timeout=1.0)
+        assert result["status"] == "idle"
+        assert result["response"] == "second-done"
+
+
+async def test_first_background_run_returns_running_not_queued(
+    tmp_path: Path,
+) -> None:
+    """A push to an idle session reports status='running' (not 'queued')."""
+    skill = _make_skill(tmp_path)
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=_make_mock_result())
+        mock_build.return_value = mock_agent
+
+        result = await server._run_skill(skill, "go", run_in_background=True)
+        assert result["status"] == "running"
+        assert result["mailbox_depth"] == 1
+        store = server._get_session_store()
+        await asyncio.wait_for(store.drain(result["session_id"]), timeout=1.0)
+
+
+async def test_skill_mismatch_on_resume_returns_error(tmp_path: Path) -> None:
+    """Resuming a session with a different skill is rejected."""
+    skill_a = _make_skill(tmp_path, name="skill-a")
+    skill_b = _make_skill(tmp_path, name="skill-b")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=_make_mock_result())
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill_a, "go")
+        sid = first["session_id"]
+
+        # Now try to resume the same session with a different skill
+        second = await server._run_skill(skill_b, "go", session_id=sid)
+        assert second["status"] == "skill_mismatch"
+        assert "skill-a" in second["error"]
+        assert "skill-b" in second["error"]
+        # Resume must NOT have run -- only the original turn's messages exist
+        store = server._get_session_store()
+        session = store.get(sid)
+        assert session is not None
+        assert len(session.messages) == 2  # only the first turn
+
+
+async def test_list_sessions_includes_mailbox_depth(tmp_path: Path) -> None:
+    """The list_sessions output exposes the per-session mailbox_depth."""
+    skill = _make_skill(tmp_path)
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        sid = first["session_id"]
+        # Park a second item in the mailbox while the first is in flight
+        await server._run_skill(
+            skill, "again", session_id=sid, run_in_background=True
+        )
+
+        # Wait until the worker has picked up the first item and is
+        # blocked inside the agent call. At that point mailbox_depth
+        # reflects only the queued (not in-flight) item.
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker enters agent call",
+        )
+
+        result_json = await server.list_sessions()
+        listing = json.loads(result_json)
+        entry = next(s for s in listing if s["session_id"] == sid)
+        assert entry["mailbox_depth"] == 1
+        assert entry["status"] == "running"
+
+        # Drain so the fixture teardown is clean
+        can_finish.set()
+        store = server._get_session_store()
+        await asyncio.wait_for(store.drain(sid), timeout=1.0)
+
+
+async def test_worker_lazy_started_on_first_push(tmp_path: Path) -> None:
+    """A worker is created on the first push and survives subsequent pushes."""
+    skill = _make_skill(tmp_path)
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=_make_mock_result())
+        mock_build.return_value = mock_agent
+
+        store = server._get_session_store()
+        first = await server._run_skill(skill, "one", run_in_background=True)
+        sid = first["session_id"]
+        # Worker exists immediately after the first push
+        assert store.has_worker(sid)
+        await asyncio.wait_for(store.drain(sid), timeout=1.0)
+        # Worker is still alive between turns -- it blocks on mailbox.get()
+        assert store.has_worker(sid)
+
+
+async def test_shutdown_drains_workers_no_pending_warnings(
+    tmp_path: Path,
+) -> None:
+    """SessionStore.shutdown() must terminate workers cleanly.
+
+    The fixture teardown calls shutdown() automatically, but exercising
+    it explicitly verifies no 'Task was destroyed but it is pending'
+    warnings appear when the loop tears down.
+    """
+    skill = _make_skill(tmp_path)
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=_make_mock_result())
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        sid = first["session_id"]
+        store = server._get_session_store()
+        await asyncio.wait_for(store.drain(sid), timeout=1.0)
+        assert store.has_worker(sid) is True
+
+        await store.shutdown()
+        assert store.has_worker(sid) is False
+
+
+# -- Phase 6: backpressure (semaphore + mailbox cap) --
+
+
+def _override_backpressure_config(
+    tmp_path: Path,
+    *,
+    max_concurrent_runs: int = 4,
+    mailbox_max_depth: int = 16,
+) -> None:
+    """Reset server singletons with custom backpressure knobs.
+
+    Mirrors ``_override_streaming_config`` but for the Phase 6 caps.
+    Clearing ``_session_store`` forces a fresh SessionStore (and thus
+    a fresh ``run_semaphore``) on the next access, sized by the
+    config's ``max_concurrent_runs``.
+    """
+    server._config = ServerConfig(
+        session_dir=str(tmp_path / "sessions"),
+        inbox_dir=str(tmp_path / "inbox"),
+        streaming=False,
+        max_concurrent_runs=max_concurrent_runs,
+        mailbox_max_depth=mailbox_max_depth,
+    )
+    server._session_store = None
+    server._inbox = None
+
+
+async def test_env_var_max_concurrent_runs_reaches_store_semaphore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SUBAGENT_MCP_MAX_CONCURRENT_RUNS flows env → config → SessionStore.
+
+    The existing ``test_config.py`` suite verifies the env → ServerConfig
+    leg; this test covers the second leg -- that the config value reaches
+    the SessionStore's run semaphore on bootstrap -- so no one can break
+    the wiring between ``_get_config`` and ``_get_session_store`` without
+    a test failure.
+    """
+    monkeypatch.setenv("SUBAGENT_MCP_MAX_CONCURRENT_RUNS", "3")
+    # Force the server to reload config from the environment on next
+    # access, not from the fixture-installed ServerConfig.
+    server._config = None
+    server._session_store = None
+
+    store = server._get_session_store()
+    # asyncio.Semaphore exposes its current permit count via ``_value``;
+    # on a fresh, unacquired semaphore that equals max_concurrent_runs.
+    assert store.run_semaphore._value == 3
+
+
+async def test_mailbox_full_rejects_background_push(tmp_path: Path) -> None:
+    """A background push that would exceed mailbox_max_depth is rejected.
+
+    The first push runs and blocks the worker; the second push fits
+    within the cap (mailbox_max_depth=1 means one queued item allowed);
+    the third push must be rejected with status='mailbox_full'.
+    """
+    _override_backpressure_config(tmp_path, mailbox_max_depth=1)
+    skill = _make_skill(tmp_path)
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill, "one", run_in_background=True)
+        sid = first["session_id"]
+        # Wait until the worker has picked up item 1 and is blocked
+        # inside the agent call (depth becomes 0).
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker picks up first item",
+        )
+
+        # Item 2 fits (depth 0 -> 1, cap is 1).
+        second = await server._run_skill(
+            skill, "two", session_id=sid, run_in_background=True
+        )
+        assert second["status"] == "queued"
+
+        # Item 3 must be rejected (depth would go from 1 to 2, > cap of 1).
+        third = await server._run_skill(
+            skill, "three", session_id=sid, run_in_background=True
+        )
+        assert third["status"] == "mailbox_full"
+        assert third["session_id"] == sid
+        assert third["mailbox_depth"] == 1
+        assert third["mailbox_max_depth"] == 1
+        assert "mailbox is full" in third["error"]
+
+        # The mailbox still has only one queued item -- the rejected push
+        # must NOT have enqueued.
+        store = server._get_session_store()
+        assert store.mailbox_depth(sid) == 1
+
+        # Drain so teardown is clean
+        can_finish.set()
+        await asyncio.wait_for(store.drain(sid), timeout=1.0)
+
+
+async def test_mailbox_full_rejects_foreground_push(tmp_path: Path) -> None:
+    """Foreground pushes also respect the mailbox cap (no bypass).
+
+    A foreground caller must not be able to dodge the cap by simply
+    omitting run_in_background -- otherwise the cap would be a
+    background-only knob and a runaway sync caller would still pile up
+    work on the session.
+    """
+    _override_backpressure_config(tmp_path, mailbox_max_depth=1)
+    skill = _make_skill(tmp_path)
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        # Background fills the in-flight slot
+        first = await server._run_skill(skill, "one", run_in_background=True)
+        sid = first["session_id"]
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker picks up first item",
+        )
+
+        # Background fills the one queued slot (depth 0 -> 1)
+        await server._run_skill(
+            skill, "two", session_id=sid, run_in_background=True
+        )
+
+        # Foreground push must be rejected immediately, not block
+        result = await asyncio.wait_for(
+            server._run_skill(skill, "three", session_id=sid),
+            timeout=1.0,
+        )
+        assert result["status"] == "mailbox_full"
+        assert result["mailbox_depth"] == 1
+
+        can_finish.set()
+        store = server._get_session_store()
+        await asyncio.wait_for(store.drain(sid), timeout=1.0)
+
+
+async def test_foreground_blocks_when_semaphore_saturated(
+    tmp_path: Path,
+) -> None:
+    """Foreground launches DO NOT reject on saturation -- they wait.
+
+    Foreground = Ask mode: the caller's contract is "wait until done".
+    The semaphore wait happens inside the worker; the caller's future
+    is unblocked once the slot frees up and the turn completes.
+    """
+    _override_backpressure_config(tmp_path, max_concurrent_runs=1)
+    skill = _make_skill(tmp_path)
+    can_finish_a = asyncio.Event()
+    call_count = 0
+
+    async def staged_run(*_a: object, **_k: object) -> MagicMock:
+        # Distinguish A vs B by call order: A is enqueued first, holds
+        # the only semaphore slot, and waits for the gate. B starts
+        # only after A's slot is released.
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            await can_finish_a.wait()
+            return _make_mock_result("a-done")
+        return _make_mock_result("b-done")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=staged_run)
+        mock_build.return_value = mock_agent
+
+        # Session A: background run holds the only slot
+        a = await server._run_skill(skill, "go", run_in_background=True)
+        a_sid = a["session_id"]
+        store = server._get_session_store()
+        await yield_until(
+            lambda: store.run_semaphore.locked(),
+            description="session A acquires the run semaphore",
+        )
+
+        # Session B: a foreground launch must NOT reject; it should
+        # block until session A finishes and the slot frees up.
+        b_task = asyncio.create_task(server._run_skill(skill, "go"))
+        # Give the event loop a few ticks; B should remain pending
+        # because A still holds the only slot.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not b_task.done()
+
+        # Release A; B should now run and complete
+        can_finish_a.set()
+        b_result = await asyncio.wait_for(b_task, timeout=1.0)
+        assert b_result["status"] == "idle"
+        assert b_result["response"] == "b-done"
+
+        await asyncio.wait_for(store.drain(a_sid), timeout=1.0)
+        await asyncio.wait_for(
+            store.drain(b_result["session_id"]), timeout=1.0
+        )
+
+
+async def test_semaphore_releases_after_turn_completes(tmp_path: Path) -> None:
+    """A completed turn releases its semaphore slot for the next caller."""
+    _override_backpressure_config(tmp_path, max_concurrent_runs=1)
+    skill = _make_skill(tmp_path)
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=_make_mock_result())
+        mock_build.return_value = mock_agent
+
+        # Run the first turn to completion
+        first = await server._run_skill(skill, "one", run_in_background=True)
+        store = server._get_session_store()
+        await asyncio.wait_for(
+            store.drain(first["session_id"]), timeout=1.0
+        )
+
+        # Semaphore must be free again
+        assert not store.run_semaphore.locked()
+
+        # A second background launch should not be rejected
+        second = await server._run_skill(
+            skill, "two", run_in_background=True
+        )
+        assert second["status"] in ("running", "queued")
+        await asyncio.wait_for(
+            store.drain(second["session_id"]), timeout=1.0
+        )
+
+
+# -- Phase 7: stop_session tool --
+
+
+async def test_stop_session_tool_not_found(tmp_path: Path) -> None:
+    """The MCP tool returns status='not_found' for an unknown session."""
+    result_json = await server.stop_session("never-existed")
+    result = json.loads(result_json)
+    assert result["status"] == "not_found"
+    assert result["session_id"] == "never-existed"
+    assert result["in_flight_cancelled"] == 0
+    assert result["queued_dropped"] == 0
+
+
+async def test_stop_session_tool_already_idle(tmp_path: Path) -> None:
+    """A session with no worker returns 'already_idle'."""
+    store = server._get_session_store()
+    session = store.create("skill", "gemma4:12b")
+
+    result_json = await server.stop_session(session.session_id)
+    result = json.loads(result_json)
+    assert result["status"] == "already_idle"
+
+
+async def test_stop_session_tool_cancels_inflight_run(tmp_path: Path) -> None:
+    """Stopping a session with an in-flight background run cancels it.
+
+    The cancelled run flips the session to 'failed' (its on-exit
+    BaseException handler) and writes a 'cancelled' notification to
+    the inbox. The semaphore slot is released so a follow-up run
+    can start.
+    """
+    skill = _make_skill(tmp_path)
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        sid = first["session_id"]
+        # Wait until the worker is blocked inside the agent call.
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker enters agent call",
+        )
+
+        result_json = await server.stop_session(sid)
+        result = json.loads(result_json)
+
+    assert result["status"] == "stopped"
+    assert result["in_flight_cancelled"] == 1
+    assert result["queued_dropped"] == 0
+
+    # The cancelled turn writes a 'cancelled' notification on the way out
+    inbox = server._get_inbox()
+    notifications, _ = inbox.read(since="")
+    assert len(notifications) == 1
+    assert notifications[0]["status"] == "cancelled"
+    assert notifications[0]["session_id"] == sid
+
+    # The session was bumped to 'failed' by _execute_skill_turn's
+    # BaseException handler -- "failed" is the resumable cancelled
+    # state, distinct from the normal idle/running enum values.
+    store = server._get_session_store()
+    reloaded = store.get(sid)
+    assert reloaded is not None
+    assert reloaded.status == "failed"
+
+    # No worker remains and the semaphore slot is freed
+    assert store.has_worker(sid) is False
+    assert not store.run_semaphore.locked()
+
+
+async def test_stop_session_tool_drops_queued_items(tmp_path: Path) -> None:
+    """Queued items are dropped from the mailbox without running."""
+    skill = _make_skill(tmp_path)
+    can_finish = asyncio.Event()
+    call_count = 0
+
+    async def staged_run(*_a: object, **_k: object) -> MagicMock:
+        nonlocal call_count
+        call_count += 1
+        await can_finish.wait()
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=staged_run)
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill, "one", run_in_background=True)
+        sid = first["session_id"]
+        # Wait until item 1 is in flight (worker entered the agent call).
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker enters first agent call",
+        )
+
+        # Queue two more items behind the in-flight one
+        await server._run_skill(
+            skill, "two", session_id=sid, run_in_background=True
+        )
+        await server._run_skill(
+            skill, "three", session_id=sid, run_in_background=True
+        )
+
+        store = server._get_session_store()
+        assert store.mailbox_depth(sid) == 2
+
+        result = json.loads(await server.stop_session(sid))
+
+    assert result["status"] == "stopped"
+    assert result["in_flight_cancelled"] == 1
+    assert result["queued_dropped"] == 2
+    # The two dropped items must NOT have run -- only call_count==1
+    # for the in-flight item that was cancelled.
+    assert call_count == 1
+
+
+async def test_stop_session_unblocks_foreground_waiter(tmp_path: Path) -> None:
+    """A foreground caller waiting on a queued item gets cancelled, not hung.
+
+    The dropped queued item carries a future that the foreground
+    caller is awaiting. on_drop must cancel that future so the
+    caller's await raises CancelledError instead of hanging forever.
+    """
+    skill = _make_skill(tmp_path)
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        # Background run holds the worker
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        sid = first["session_id"]
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker enters agent call",
+        )
+
+        # Foreground resume sits behind the in-flight item
+        fg_task = asyncio.create_task(
+            server._run_skill(skill, "again", session_id=sid)
+        )
+        # Give the event loop a few ticks; fg_task should remain pending
+        # because the first item is still blocking the worker.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not fg_task.done()
+
+        # Stop -- the foreground waiter must be unblocked with cancellation
+        await server.stop_session(sid)
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(fg_task, timeout=1.0)
+
+
+async def test_stop_session_is_idempotent_via_tool(tmp_path: Path) -> None:
+    """Calling stop twice in a row is safe; the second call says already_idle."""
+    skill = _make_skill(tmp_path)
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        sid = first["session_id"]
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker enters agent call",
+        )
+
+        result1 = json.loads(await server.stop_session(sid))
+        result2 = json.loads(await server.stop_session(sid))
+
+    assert result1["status"] == "stopped"
+    assert result2["status"] == "already_idle"
+    assert result2["in_flight_cancelled"] == 0
+    assert result2["queued_dropped"] == 0
+
+
+async def test_stop_session_followed_by_resume(tmp_path: Path) -> None:
+    """After stop, the session can be resumed and runs cleanly.
+
+    Stop tears down the worker but leaves the session record intact
+    (modulo the failed status from the cancellation), so a fresh
+    push must spin up a new worker and complete normally.
+    """
+    skill = _make_skill(tmp_path)
+    first_can_finish = asyncio.Event()
+    call_count = 0
+
+    async def staged_run(*_a: object, **_k: object) -> MagicMock:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            await first_can_finish.wait()
+            return _make_mock_result("first")
+        return _make_mock_result("second")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=staged_run)
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        sid = first["session_id"]
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker enters first agent call",
+        )
+
+        await server.stop_session(sid)
+
+        # Resume must spin up a fresh worker and complete normally
+        result = await server._run_skill(
+            skill, "again", session_id=sid
+        )
+
+    assert result["session_id"] == sid
+    assert result["status"] == "idle"
+    assert result["response"] == "second"
+
+
+async def test_mailbox_full_does_not_apply_to_skill_mismatch(
+    tmp_path: Path,
+) -> None:
+    """Skill-mismatch check still wins even on a full mailbox.
+
+    Order of admission checks matters: a session bound to a different
+    skill must surface skill_mismatch (which is the actionable error),
+    not mailbox_full (which is recoverable but misleading here).
+    """
+    _override_backpressure_config(tmp_path, mailbox_max_depth=1)
+    skill_a = _make_skill(tmp_path, name="skill-a")
+    skill_b = _make_skill(tmp_path, name="skill-b")
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill_a, "go", run_in_background=True)
+        sid = first["session_id"]
+        await yield_until(
+            lambda: mock_agent.run.await_count >= 1,
+            description="worker enters first agent call",
+        )
+        # Park one item in the mailbox (depth 1, at cap)
+        await server._run_skill(
+            skill_a, "again", session_id=sid, run_in_background=True
+        )
+
+        # A push with the wrong skill must report skill_mismatch, not
+        # mailbox_full -- the mismatch check runs first.
+        wrong = await server._run_skill(
+            skill_b, "go", session_id=sid, run_in_background=True
+        )
+        assert wrong["status"] == "skill_mismatch"
+
+        can_finish.set()
+        store = server._get_session_store()
+        await asyncio.wait_for(store.drain(sid), timeout=1.0)

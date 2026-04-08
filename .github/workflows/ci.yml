@@ -16,7 +16,7 @@ jobs:
           version: "latest"
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - run: uv sync --extra dev
       - run: uv run ruff check src/ tests/
       - run: uv run mypy src/

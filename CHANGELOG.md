@@ -2,14 +2,18 @@
 
 ## Unreleased
 
-<!-- bump: patch -->
-
-### Changed
-
-- Document mid-stream staleness of `get_session_transcript` in `docs/DESIGN.md`; cross-link `get_session_transcript` and `tail_session_log` MCP tool descriptions so LLM callers pick the right one (#9).
+<!-- bump: minor -->
 
 ### Added
 
+- Asynchronous / background skill runs via `run_in_background=true` on `run_skill_by_name` (and the per-skill `skill_*` tools). A background launch enqueues a work item on the session's mailbox and returns immediately with `status` of `running` or `queued`; foreground (Ask mode) callers still block on their own turn (#19).
+- Per-session actor model: each session owns a mailbox (`asyncio.Queue`) drained FIFO by a single long-lived worker task. Concurrent resumes to the same session enqueue in submission order rather than rejecting, and distinct sessions run on independent workers (#19).
+- `stop_session(session_id)` MCP tool that drains queued mailbox items, cancels the in-flight turn, and tears down the session's worker and mailbox. Returns `{status, in_flight_cancelled, queued_dropped}`. Idempotent: safe to call on an already-idle, not-found, or just-stopped session. A cancelled turn writes a `cancelled` trailer to the session log and a `cancelled` notification to the inbox on the way out (#19).
+- Backpressure: `max_concurrent_runs` (default `4`) is a server-wide `asyncio.Semaphore` owned by the `SessionStore` and acquired by the session worker around the actual turn execution; `mailbox_max_depth` (default `16`) is a per-session cap on queued items and is the only admission-time rejection (`status="mailbox_full"`, foreground and background alike). Both knobs are settable via `.subagent-mcp.json` or the env vars `SUBAGENT_MCP_MAX_CONCURRENT_RUNS` and `SUBAGENT_MCP_MAILBOX_MAX_DEPTH` (#19).
+- Durable completion outbox at `.subagent-inbox/` (configurable via `inbox_dir`). Every turn exit path (`ok` / `error` / `cancelled`) writes one atomically-renamed `{uuid7}.json` record with `session_id`, `skill`, `model`, `status`, `timestamp`, and a short `summary`. Filename lexicographic order matches arrival order. A new `read_inbox(since, limit)` MCP tool exposes the outbox for pull-mode consumers (#19).
+- Claude Code `UserPromptSubmit` hook bridge (`scripts/notification_hook.py` + `scripts/notification-hook.sh`). On every prompt submit the hook drains new inbox records, emits `<subagent-mcp-notification>` blocks into the next-turn context, and advances a cursor at `.subagent-inbox/.cursor`. The hook is standalone (does not import the package), at-least-once with an idempotent consumer, and fail-soft (always exits 0) so a misconfigured hook cannot break a prompt submit (#19).
+- Session lifecycle fields: `status` (`idle` / `running` / `failed`) and `last_active` are persisted on every save and returned from `list_sessions` alongside a new `mailbox_depth` field (#19).
+- **ACTION:** To receive completion notifications automatically, wire `scripts/notification-hook.sh` as a `UserPromptSubmit` hook in `.claude/settings.json`. See `README.md` for the full hook configuration (#19).
 - Per-turn completion trailer (`--- end ok ---` / `--- end error ---` / `--- end cancelled ---`) on streaming session logs so tail clients can detect completion, errors, and client-disconnect cancellation (#8).
 - Streaming unit tests closing the D1 (resume-from-disk multi-turn) and D3 (concurrent tail mid-stream) coverage gaps from the #4 final integration review. D2 (mid-stream error) was already covered by the trailer tests added in #8 (#11).
 - Streaming skill execution via `agent.run_stream()`, gated by a new `streaming: bool` config field (default `true`) with `SUBAGENT_MCP_STREAMING` env override
@@ -26,6 +30,10 @@
 - Tests for tools, server, config, session, and skills (28 total)
 - `docs/ARCHITECTURE.md` with system context diagram and ADRs
 - `docs/DESIGN.md` with skill discovery, session, and security patterns
+
+### Changed
+
+- Document mid-stream staleness of `get_session_transcript` in `docs/DESIGN.md`; cross-link `get_session_transcript` and `tail_session_log` MCP tool descriptions so LLM callers pick the right one (#9).
 
 ### Fixed
 
