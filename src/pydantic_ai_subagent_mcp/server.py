@@ -193,11 +193,20 @@ async def _run_skill(
     model: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
-    """Execute a skill with the subagent and return results."""
+    """Execute a skill with the subagent and return results.
+
+    Concurrency: holds the per-session lock from the start of the agent
+    invocation through the persistence of the resulting message_history.
+    Concurrent calls against the same session_id serialize linearizably,
+    so a session's history is never interleaved or clobbered. Distinct
+    sessions remain independent.
+    """
     store = _get_session_store()
     config = _get_config()
 
-    # Resume or create session
+    # Resume or create session. Resolution happens before acquiring the
+    # lock so we have a session_id to lock on; for new sessions there can
+    # be no concurrent writers anyway since the UUID is fresh.
     session = None
     if session_id:
         session = store.get(session_id)
@@ -205,39 +214,40 @@ async def _run_skill(
         effective_model = model or config.default_model
         session = store.create(skill.name, effective_model)
 
-    agent = _build_agent(skill, model or session.model)
+    async with store.lock(session.session_id):
+        agent = _build_agent(skill, model or session.model)
 
-    try:
-        if config.streaming:
-            output, messages = await _run_skill_streaming(
-                agent, prompt, session, store
-            )
-        else:
-            result = await agent.run(
-                prompt,
-                message_history=session.messages or None,
-            )
-            output = result.output
-            messages = result.all_messages()
+        try:
+            if config.streaming:
+                output, messages = await _run_skill_streaming(
+                    agent, prompt, session, store
+                )
+            else:
+                result = await agent.run(
+                    prompt,
+                    message_history=session.messages or None,
+                )
+                output = result.output
+                messages = result.all_messages()
 
-        session.messages = messages
-        store.save(session)
+            session.messages = messages
+            store.save(session)
 
-        return {
-            "session_id": session.session_id,
-            "response": output,
-            "model": session.model,
-            "skill": skill.name,
-        }
-    except Exception as e:
-        error_msg = f"Error running skill '{skill.name}': {e}"
-        logger.exception(error_msg)
-        return {
-            "session_id": session.session_id,
-            "error": error_msg,
-            "model": session.model,
-            "skill": skill.name,
-        }
+            return {
+                "session_id": session.session_id,
+                "response": output,
+                "model": session.model,
+                "skill": skill.name,
+            }
+        except Exception as e:
+            error_msg = f"Error running skill '{skill.name}': {e}"
+            logger.exception(error_msg)
+            return {
+                "session_id": session.session_id,
+                "error": error_msg,
+                "model": session.model,
+                "skill": skill.name,
+            }
 
 
 def _register_skill_tool(skill: Skill) -> None:
