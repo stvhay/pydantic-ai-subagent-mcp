@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic_ai.messages import (
@@ -444,6 +445,147 @@ def test_touch_updates_last_active_in_cache(tmp_path: Path) -> None:
 def test_touch_unknown_session_is_noop(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "sessions")
     store.touch("never-existed")  # must not raise
+
+
+# -- Phase 7: stop_session --
+
+
+async def test_stop_session_not_found(tmp_path: Path) -> None:
+    """Stopping a session that does not exist returns 'not_found'."""
+    store = SessionStore(tmp_path / "sessions")
+    result = await store.stop_session("never-existed")
+    assert result["status"] == "not_found"
+    assert result["in_flight_cancelled"] == 0
+    assert result["queued_dropped"] == 0
+
+
+async def test_stop_session_already_idle(tmp_path: Path) -> None:
+    """A session that exists but has no worker returns 'already_idle'."""
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create("skill", "gemma4:12b")
+    result = await store.stop_session(session.session_id)
+    assert result["status"] == "already_idle"
+    assert result["in_flight_cancelled"] == 0
+    assert result["queued_dropped"] == 0
+
+
+async def test_stop_session_cancels_idle_worker(tmp_path: Path) -> None:
+    """Stop tears down a worker that is blocked on an empty mailbox."""
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create("skill", "gemma4:12b")
+    mb = store.get_or_create_mailbox(session.session_id)
+
+    async def worker() -> None:
+        await mb.get()  # blocks forever -- the test stops it
+
+    task = asyncio.create_task(worker())
+    store.register_worker(session.session_id, task)
+    await asyncio.sleep(0)  # let the worker reach its await
+
+    result = await store.stop_session(session.session_id)
+
+    # The worker counts as in-flight from stop's perspective: it was
+    # alive at the moment of cancellation. The test for an idle
+    # worker (no items, blocked on get) is the simplest cancellation
+    # path the implementation has to handle correctly.
+    assert result["status"] == "stopped"
+    assert result["in_flight_cancelled"] == 1
+    assert result["queued_dropped"] == 0
+    assert task.cancelled() or task.done()
+    # Registries are cleared so a fresh push starts a fresh worker
+    assert store.has_worker(session.session_id) is False
+    assert store.mailbox_depth(session.session_id) == 0
+
+
+async def test_stop_session_drains_queued_items_and_calls_on_drop(
+    tmp_path: Path,
+) -> None:
+    """Queued items are pulled from the mailbox and passed to on_drop.
+
+    The worker for this test never actually pulls from the mailbox,
+    so the queued items are still sitting there at the moment of
+    stop. They must be drained and reported.
+    """
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create("skill", "gemma4:12b")
+    mb = store.get_or_create_mailbox(session.session_id)
+
+    # Park three items in the mailbox
+    items = ["a", "b", "c"]
+    for item in items:
+        await mb.put(item)
+
+    # A worker that just blocks forever -- it will never drain
+    async def worker() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(worker())
+    store.register_worker(session.session_id, task)
+    await asyncio.sleep(0)
+
+    dropped: list[Any] = []
+    result = await store.stop_session(
+        session.session_id, on_drop=dropped.append
+    )
+
+    assert result["status"] == "stopped"
+    assert result["queued_dropped"] == 3
+    assert result["in_flight_cancelled"] == 1
+    assert dropped == ["a", "b", "c"]
+    # Mailbox is now gone (cleared from registry)
+    assert store.mailbox_depth(session.session_id) == 0
+
+
+async def test_stop_session_is_idempotent(tmp_path: Path) -> None:
+    """A second stop_session call returns 'already_idle', not an error."""
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create("skill", "gemma4:12b")
+    mb = store.get_or_create_mailbox(session.session_id)
+
+    async def worker() -> None:
+        await mb.get()
+
+    task = asyncio.create_task(worker())
+    store.register_worker(session.session_id, task)
+    await asyncio.sleep(0)
+
+    first = await store.stop_session(session.session_id)
+    assert first["status"] == "stopped"
+
+    second = await store.stop_session(session.session_id)
+    assert second["status"] == "already_idle"
+    assert second["in_flight_cancelled"] == 0
+    assert second["queued_dropped"] == 0
+
+
+async def test_stop_session_on_drop_swallows_exceptions(tmp_path: Path) -> None:
+    """A misbehaving on_drop callback must not block the drain.
+
+    The drain is best-effort: if on_drop raises on one item we keep
+    processing the others and still tear down the worker. Otherwise
+    a single broken caller could leak workers across the test
+    suite.
+    """
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create("skill", "gemma4:12b")
+    mb = store.get_or_create_mailbox(session.session_id)
+    await mb.put("first")
+    await mb.put("second")
+
+    async def worker() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(worker())
+    store.register_worker(session.session_id, task)
+    await asyncio.sleep(0)
+
+    def boom(_item: Any) -> None:
+        raise RuntimeError("on_drop is broken")
+
+    result = await store.stop_session(session.session_id, on_drop=boom)
+    assert result["status"] == "stopped"
+    assert result["queued_dropped"] == 2
+    assert store.has_worker(session.session_id) is False
 
 
 def test_session_dataclass_defaults() -> None:

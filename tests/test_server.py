@@ -1494,6 +1494,235 @@ async def test_semaphore_releases_after_turn_completes(tmp_path: Path) -> None:
         )
 
 
+# -- Phase 7: stop_session tool --
+
+
+async def test_stop_session_tool_not_found(tmp_path: Path) -> None:
+    """The MCP tool returns status='not_found' for an unknown session."""
+    result_json = await server.stop_session("never-existed")
+    result = json.loads(result_json)
+    assert result["status"] == "not_found"
+    assert result["session_id"] == "never-existed"
+    assert result["in_flight_cancelled"] == 0
+    assert result["queued_dropped"] == 0
+
+
+async def test_stop_session_tool_already_idle(tmp_path: Path) -> None:
+    """A session with no worker returns 'already_idle'."""
+    store = server._get_session_store()
+    session = store.create("skill", "gemma4:12b")
+
+    result_json = await server.stop_session(session.session_id)
+    result = json.loads(result_json)
+    assert result["status"] == "already_idle"
+
+
+async def test_stop_session_tool_cancels_inflight_run(tmp_path: Path) -> None:
+    """Stopping a session with an in-flight background run cancels it.
+
+    The cancelled run flips the session to 'failed' (its on-exit
+    BaseException handler) and writes a 'cancelled' notification to
+    the inbox. The semaphore slot is released so a follow-up run
+    can start.
+    """
+    skill = _make_skill(tmp_path)
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        sid = first["session_id"]
+        # Yield so the worker reaches the blocking agent call
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        result_json = await server.stop_session(sid)
+        result = json.loads(result_json)
+
+    assert result["status"] == "stopped"
+    assert result["in_flight_cancelled"] == 1
+    assert result["queued_dropped"] == 0
+
+    # The cancelled turn writes a 'cancelled' notification on the way out
+    inbox = server._get_inbox()
+    notifications, _ = inbox.read(since="")
+    assert len(notifications) == 1
+    assert notifications[0]["status"] == "cancelled"
+    assert notifications[0]["session_id"] == sid
+
+    # The session was bumped to 'failed' by _execute_skill_turn's
+    # BaseException handler -- "failed" is the resumable cancelled
+    # state, distinct from the normal idle/running enum values.
+    store = server._get_session_store()
+    reloaded = store.get(sid)
+    assert reloaded is not None
+    assert reloaded.status == "failed"
+
+    # No worker remains and the semaphore slot is freed
+    assert store.has_worker(sid) is False
+    assert not server._get_run_semaphore().locked()
+
+
+async def test_stop_session_tool_drops_queued_items(tmp_path: Path) -> None:
+    """Queued items are dropped from the mailbox without running."""
+    skill = _make_skill(tmp_path)
+    can_finish = asyncio.Event()
+    call_count = 0
+
+    async def staged_run(*_a: object, **_k: object) -> MagicMock:
+        nonlocal call_count
+        call_count += 1
+        await can_finish.wait()
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=staged_run)
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill, "one", run_in_background=True)
+        sid = first["session_id"]
+        # Yield so item 1 is in flight (worker entered the agent call)
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        # Queue two more items behind the in-flight one
+        await server._run_skill(
+            skill, "two", session_id=sid, run_in_background=True
+        )
+        await server._run_skill(
+            skill, "three", session_id=sid, run_in_background=True
+        )
+
+        store = server._get_session_store()
+        assert store.mailbox_depth(sid) == 2
+
+        result = json.loads(await server.stop_session(sid))
+
+    assert result["status"] == "stopped"
+    assert result["in_flight_cancelled"] == 1
+    assert result["queued_dropped"] == 2
+    # The two dropped items must NOT have run -- only call_count==1
+    # for the in-flight item that was cancelled.
+    assert call_count == 1
+
+
+async def test_stop_session_unblocks_foreground_waiter(tmp_path: Path) -> None:
+    """A foreground caller waiting on a queued item gets cancelled, not hung.
+
+    The dropped queued item carries a future that the foreground
+    caller is awaiting. on_drop must cancel that future so the
+    caller's await raises CancelledError instead of hanging forever.
+    """
+    skill = _make_skill(tmp_path)
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        # Background run holds the worker
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        sid = first["session_id"]
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        # Foreground resume sits behind the in-flight item
+        fg_task = asyncio.create_task(
+            server._run_skill(skill, "again", session_id=sid)
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not fg_task.done()
+
+        # Stop -- the foreground waiter must be unblocked with cancellation
+        await server.stop_session(sid)
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(fg_task, timeout=1.0)
+
+
+async def test_stop_session_is_idempotent_via_tool(tmp_path: Path) -> None:
+    """Calling stop twice in a row is safe; the second call says already_idle."""
+    skill = _make_skill(tmp_path)
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        sid = first["session_id"]
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        result1 = json.loads(await server.stop_session(sid))
+        result2 = json.loads(await server.stop_session(sid))
+
+    assert result1["status"] == "stopped"
+    assert result2["status"] == "already_idle"
+    assert result2["in_flight_cancelled"] == 0
+    assert result2["queued_dropped"] == 0
+
+
+async def test_stop_session_followed_by_resume(tmp_path: Path) -> None:
+    """After stop, the session can be resumed and runs cleanly.
+
+    Stop tears down the worker but leaves the session record intact
+    (modulo the failed status from the cancellation), so a fresh
+    push must spin up a new worker and complete normally.
+    """
+    skill = _make_skill(tmp_path)
+    first_can_finish = asyncio.Event()
+    call_count = 0
+
+    async def staged_run(*_a: object, **_k: object) -> MagicMock:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            await first_can_finish.wait()
+            return _make_mock_result("first")
+        return _make_mock_result("second")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=staged_run)
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        sid = first["session_id"]
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        await server.stop_session(sid)
+
+        # Resume must spin up a fresh worker and complete normally
+        result = await server._run_skill(
+            skill, "again", session_id=sid
+        )
+
+    assert result["session_id"] == sid
+    assert result["status"] == "idle"
+    assert result["response"] == "second"
+
+
 async def test_mailbox_full_does_not_apply_to_skill_mismatch(
     tmp_path: Path,
 ) -> None:

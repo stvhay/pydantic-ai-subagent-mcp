@@ -675,6 +675,39 @@ async def read_inbox(since: str = "", limit: int = 50) -> str:
 
 
 @mcp_server.tool(
+    name="stop_session",
+    description=(
+        "Stop a running or queued session. Cancels the in-flight turn "
+        "(if any), drops every queued item from the session's mailbox, "
+        "and tears down the session's worker. Returns JSON with "
+        "session_id, status (stopped / already_idle / not_found), "
+        "in_flight_cancelled (0 or 1), and queued_dropped (count of "
+        "items dropped from the mailbox). Idempotent: calling on a "
+        "session that is already idle, not running, or not found "
+        "returns a sensible status without raising. A cancelled "
+        "in-flight turn writes a 'cancelled' trailer to the session "
+        "log and a 'cancelled' notification to the inbox so observers "
+        "can detect the stop on their normal completion paths."
+    ),
+)
+async def stop_session(session_id: str) -> str:
+    store = _get_session_store()
+
+    def _drop_item(item: Any) -> None:
+        # The work item we drained was waiting in the mailbox, never
+        # picked up by the worker. If a foreground caller is awaiting
+        # its future, we must cancel it explicitly -- otherwise the
+        # caller would hang forever waiting for a turn that will
+        # never run.
+        future = getattr(item, "future", None)
+        if future is not None and not future.done():
+            future.cancel()
+
+    result = await store.stop_session(session_id, on_drop=_drop_item)
+    return json.dumps(result, indent=2)
+
+
+@mcp_server.tool(
     name="run_skill_by_name",
     description=(
         "Run any skill by name with a prompt. Use this when you know the skill name "

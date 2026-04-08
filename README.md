@@ -82,6 +82,10 @@ Properties of the hook:
 
 If your inbox lives outside the project root, set `SUBAGENT_MCP_INBOX_DIR` in the hook environment.
 
+### Stopping a session
+
+Call the `stop_session` MCP tool with a `session_id` to cancel an in-flight turn and drop any queued items from the session's mailbox. The tool returns JSON with `status` (`stopped` / `already_idle` / `not_found`), `in_flight_cancelled` (`0` or `1`), and `queued_dropped` (count). Stop is idempotent: calling on a session that is already idle, missing, or just stopped is safe and returns a sensible status without raising. A cancelled in-flight turn writes a `cancelled` trailer to the session log and a `cancelled` notification to the inbox, so observers detect the stop on their normal completion paths. After a stop, the session record stays on disk and can be resumed by a fresh push, which will spin up a new worker on a new mailbox.
+
 ### Backpressure
 
 Two independent caps protect the server from runaway producers:

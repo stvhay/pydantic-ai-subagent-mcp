@@ -7,7 +7,7 @@ import json
 import os
 import tempfile
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -256,6 +256,108 @@ class SessionStore:
                 await w
         self._workers.clear()
         self._mailboxes.clear()
+
+    async def stop_session(
+        self,
+        session_id: str,
+        on_drop: Callable[[Any], None] | None = None,
+    ) -> dict[str, Any]:
+        """Stop a session: drain queued items, cancel the worker, await it.
+
+        Returns a structured snapshot of what was actually stopped:
+
+        * ``status`` -- one of ``"stopped"`` (work was cancelled),
+          ``"already_idle"`` (no worker / nothing to stop), or
+          ``"not_found"`` (no on-disk session for this id).
+        * ``in_flight_cancelled`` -- ``1`` if a worker task was alive
+          and got cancelled, ``0`` otherwise.
+        * ``queued_dropped`` -- number of items pulled out of the
+          mailbox without being executed.
+
+        Idempotent by construction: calling on a stopped/idle/missing
+        session returns a sensible status without raising. Concurrent
+        ``stop_session`` calls on the same session are safe -- the
+        second call observes ``has_worker == False`` and returns
+        ``already_idle``.
+
+        ``on_drop`` is invoked once per dropped queued item before
+        ``task_done`` is called, so the server-side caller can
+        cancel any per-item futures (foreground waiters) that would
+        otherwise hang. The in-flight item is *not* passed to
+        ``on_drop`` -- its future is handled by the worker's own
+        cancellation path in ``_session_worker``.
+        """
+        # Session must exist on disk OR in cache to be considered
+        # "found". A bare worker/mailbox without a session record is
+        # legitimately "stopped" but not "not_found", so check the
+        # session existence after the worker check below.
+        has_worker = self.has_worker(session_id)
+        mailbox = self._mailboxes.get(session_id)
+        on_disk = self._session_path(session_id).exists()
+        in_cache = session_id in self._sessions
+
+        if not has_worker and mailbox is None:
+            if not on_disk and not in_cache:
+                return {
+                    "session_id": session_id,
+                    "status": "not_found",
+                    "in_flight_cancelled": 0,
+                    "queued_dropped": 0,
+                }
+            return {
+                "session_id": session_id,
+                "status": "already_idle",
+                "in_flight_cancelled": 0,
+                "queued_dropped": 0,
+            }
+
+        # Drain any queued items first so the worker, when it wakes
+        # from cancellation, has nothing left to mistakenly process.
+        # Each drained item is passed to on_drop so the caller can
+        # unblock any waiting foreground future, then task_done is
+        # called to keep the queue's join() counter consistent.
+        dropped = 0
+        if mailbox is not None:
+            while not mailbox.empty():
+                try:
+                    item = mailbox.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if on_drop is not None:
+                    with suppress(Exception):
+                        on_drop(item)
+                mailbox.task_done()
+                dropped += 1
+
+        # Cancel and await the worker. The worker may be:
+        #   * blocked on mailbox.get() -- cancellation unblocks
+        #     immediately, no in-flight item to clean up
+        #   * inside _execute_skill_turn -- cancellation propagates
+        #     into the streaming code; the worker's own
+        #     BaseException handler cancels the in-flight item's
+        #     future and the cancelled trailer / inbox notification
+        #     fire on the way out
+        in_flight = 0
+        worker = self._workers.get(session_id)
+        if worker is not None and not worker.done():
+            in_flight = 1
+            worker.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await worker
+
+        # Clear registries so the next push to this session starts a
+        # fresh worker on a fresh mailbox. Leaving stale entries
+        # would let queued items survive a stop, defeating the
+        # whole point.
+        self._workers.pop(session_id, None)
+        self._mailboxes.pop(session_id, None)
+
+        return {
+            "session_id": session_id,
+            "status": "stopped",
+            "in_flight_cancelled": in_flight,
+            "queued_dropped": dropped,
+        }
 
     def touch(self, session_id: str) -> None:
         """Bump ``last_active`` to now for an in-cache session.
