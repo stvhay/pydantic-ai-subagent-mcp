@@ -8,6 +8,7 @@ import logging
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, TextIO
 
@@ -315,6 +316,83 @@ async def _execute_skill_turn(
         }
 
 
+@dataclass
+class _WorkItem:
+    """One unit of work submitted to a session's mailbox.
+
+    The optional ``future`` is set by foreground callers (Ask mode):
+    they enqueue an item, then ``await`` the future for the worker's
+    result. Background callers (Tell mode) leave it as ``None`` and
+    rely on the inbox notification path for completion signaling.
+    """
+
+    skill: Skill
+    prompt: str
+    model: str | None
+    future: asyncio.Future[dict[str, Any]] | None
+
+
+async def _session_worker(session_id: str) -> None:
+    """Drain a single session's mailbox FIFO, executing one turn at a time.
+
+    Lazily started on first push to the session's mailbox, then lives
+    until ``SessionStore.shutdown()`` cancels it. The worker IS the
+    session's serializer: per-session linearizability is guaranteed
+    by the FIFO + single-consumer model, with the per-session lock
+    serving only as defense in depth in case anything bypasses the
+    queue.
+
+    Failure handling:
+      * ``_execute_skill_turn`` already catches ``Exception`` and
+        returns a dict with an ``error`` field. The worker forwards
+        that dict to the foreground caller's future as a normal result
+        — the error is informational, not exceptional, from the
+        worker's perspective.
+      * ``BaseException`` (``CancelledError``, ``KeyboardInterrupt``,
+        ``SystemExit``) propagates so the worker tears down on
+        shutdown. The current item's future is cancelled or
+        exception-set first so any waiter unblocks. Items still
+        sitting in the mailbox at that point are dropped — Phase 7's
+        ``stop_session`` will add a graceful drain path.
+    """
+    store = _get_session_store()
+    mailbox = store.get_or_create_mailbox(session_id)
+
+    while True:
+        item: _WorkItem = await mailbox.get()
+        try:
+            session = store.get(session_id)
+            if session is None:
+                # Session was deleted between push and pull. Surface
+                # the failure to the waiter (if any) and continue.
+                if item.future is not None and not item.future.done():
+                    item.future.set_exception(
+                        RuntimeError(f"session {session_id} not found")
+                    )
+                continue
+
+            try:
+                result = await _execute_skill_turn(
+                    item.skill, item.prompt, session, item.model
+                )
+            except BaseException as e:
+                # _execute_skill_turn caught Exception and returned a
+                # dict with "error", so we only land here on
+                # BaseException -- typically CancelledError during
+                # shutdown. Unblock the waiter, then propagate.
+                if item.future is not None and not item.future.done():
+                    if isinstance(e, asyncio.CancelledError):
+                        item.future.cancel()
+                    else:
+                        item.future.set_exception(e)
+                raise
+
+            if item.future is not None and not item.future.done():
+                item.future.set_result(result)
+        finally:
+            mailbox.task_done()
+
+
 async def _run_skill(
     skill: Skill,
     prompt: str,
@@ -322,53 +400,89 @@ async def _run_skill(
     session_id: str | None = None,
     run_in_background: bool = False,
 ) -> dict[str, Any]:
-    """Execute a skill, optionally in the background.
+    """Execute a skill via the per-session mailbox actor model.
 
-    Foreground (default): runs to completion under the per-session lock
-    and returns the final response (or error). Background: schedules
-    the turn as an ``asyncio.Task`` tracked by the SessionStore and
-    returns immediately with ``status="running"`` so the caller can
-    poll the log via ``tail_session_log`` and the structured transcript
-    via ``get_session_transcript`` once the run completes.
+    Both foreground and background calls enqueue a ``_WorkItem`` to
+    the session's mailbox; a per-session worker drains FIFO. Resuming
+    a busy session **enqueues** rather than rejects, and the order of
+    resumes is preserved.
 
-    Resume on a busy session is rejected with ``status="busy"`` —
-    proper mailbox queueing arrives in Phase 5.
+    Foreground (``run_in_background=False``, default) -- Ask mode:
+    enqueue an item with a Future, ``await`` the future, return its
+    result dict. The caller blocks until *its own* turn completes,
+    not until the whole queue drains.
+
+    Background (``run_in_background=True``) -- Tell mode: enqueue an
+    item with no future, return immediately. The returned ``status``
+    is ``"running"`` if the new item starts processing immediately
+    (the session was idle and the mailbox was empty) or ``"queued"``
+    if it lands behind in-flight or already-queued work. The status
+    snapshot is informational and best-effort.
+
+    Resuming a session bound to a different skill is rejected with
+    ``status="skill_mismatch"`` -- sessions are bound to a skill at
+    creation and the message history would be incoherent under
+    a different skill's system prompt.
     """
     store = _get_session_store()
     config = _get_config()
 
-    # Resume or create session. Resolution happens before acquiring the
-    # lock so we have a session_id to lock on; for new sessions there can
-    # be no concurrent writers anyway since the UUID is fresh.
+    # Resolve or create the session before touching the mailbox.
     session: Session | None = None
     if session_id:
         session = store.get(session_id)
-        if session is not None and store.is_running(session.session_id):
-            # Fail-fast on busy sessions: do not block on the lock.
-            return {
-                "session_id": session.session_id,
-                "status": "busy",
-                "skill": skill.name,
-                "model": session.model,
-            }
     if session is None:
         effective_model = model or config.default_model
         session = store.create(skill.name, effective_model)
-
-    if run_in_background:
-        task = asyncio.create_task(
-            _execute_skill_turn(skill, prompt, session, model)
-        )
-        store.register_task(session.session_id, task)
+    elif session.skill_name != skill.name:
+        # A session is bound to its skill at creation; resuming with a
+        # different skill would put incoherent system-prompt context
+        # against the existing message history.
         return {
             "session_id": session.session_id,
-            "status": "running",
+            "status": "skill_mismatch",
+            "skill": skill.name,
+            "error": (
+                f"session {session.session_id} is bound to skill "
+                f"'{session.skill_name}', cannot resume with '{skill.name}'"
+            ),
+        }
+
+    # Ensure the session's worker is running. Lazily started on the
+    # first push so idle sessions don't accumulate workers.
+    if not store.has_worker(session.session_id):
+        worker = asyncio.create_task(_session_worker(session.session_id))
+        store.register_worker(session.session_id, worker)
+
+    mailbox = store.get_or_create_mailbox(session.session_id)
+
+    # Snapshot busy state BEFORE the put so we can compute the initial
+    # status the caller sees. The check is racy by construction (the
+    # worker may transition between snapshot and put) but the cost is
+    # informational only -- actual ordering is enforced by the FIFO.
+    busy_before = store.is_busy(session.session_id)
+
+    if run_in_background:
+        item = _WorkItem(skill=skill, prompt=prompt, model=model, future=None)
+        await mailbox.put(item)
+        return {
+            "session_id": session.session_id,
+            "status": "queued" if busy_before else "running",
             "skill": skill.name,
             "model": session.model,
             "log_path": str(store.log_path(session.session_id)),
+            "mailbox_depth": store.mailbox_depth(session.session_id),
         }
 
-    return await _execute_skill_turn(skill, prompt, session, model)
+    # Foreground: enqueue and block on the future. The wait advances
+    # only when the worker has actually processed *this* item, so
+    # FIFO ordering is preserved without the caller blocking on
+    # unrelated queue elements.
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[dict[str, Any]] = loop.create_future()
+    item = _WorkItem(skill=skill, prompt=prompt, model=model, future=future)
+    await mailbox.put(item)
+    return await future
 
 
 def _register_skill_tool(skill: Skill) -> None:
@@ -483,10 +597,13 @@ async def read_inbox(since: str = "", limit: int = 50) -> str:
     description=(
         "Run any skill by name with a prompt. Use this when you know the skill name "
         "but it wasn't registered as a dedicated tool. Set run_in_background=true "
-        "to spawn the run as a background task and return immediately with "
-        "status='running'; poll tail_session_log for live output and "
-        "get_session_transcript once it completes. Resuming a busy session "
-        "returns status='busy' (mailbox queueing arrives in a later phase)."
+        "to enqueue the run on the session's mailbox and return immediately; "
+        "status is 'running' if the turn starts processing right away or "
+        "'queued' if it lands behind in-flight work. Resuming a busy session "
+        "enqueues the new prompt rather than rejecting it, preserving FIFO "
+        "order. Poll tail_session_log for live output and get_session_transcript "
+        "once the turn completes; or wire scripts/notification-hook.sh to "
+        "receive completion notifications via UserPromptSubmit."
     ),
 )
 async def run_skill_by_name(

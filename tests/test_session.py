@@ -313,37 +313,123 @@ def test_list_sessions_exposes_status_and_last_active(tmp_path: Path) -> None:
     assert entry["last_active"] == "2026-04-08T10:00:00+00:00"
 
 
-async def test_register_task_and_is_running(tmp_path: Path) -> None:
-    """register_task tracks the task; is_running reflects task.done()."""
+# -- Phase 5: per-session mailbox + worker primitives --
+
+
+async def test_get_or_create_mailbox_returns_same_queue(tmp_path: Path) -> None:
+    """Repeated calls for the same session_id return the same Queue object."""
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create("skill", "gemma4:12b")
+    mb1 = store.get_or_create_mailbox(session.session_id)
+    mb2 = store.get_or_create_mailbox(session.session_id)
+    assert mb1 is mb2
+
+
+async def test_mailbox_depth_reflects_queue_size(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create("skill", "gemma4:12b")
+    assert store.mailbox_depth(session.session_id) == 0
+    mb = store.get_or_create_mailbox(session.session_id)
+    await mb.put("a")
+    await mb.put("b")
+    assert store.mailbox_depth(session.session_id) == 2
+    await mb.get()
+    assert store.mailbox_depth(session.session_id) == 1
+
+
+async def test_mailbox_depth_unknown_session_is_zero(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    assert store.mailbox_depth("never-touched") == 0
+
+
+async def test_has_worker_tracks_registration_and_completion(
+    tmp_path: Path,
+) -> None:
     store = SessionStore(tmp_path / "sessions")
     session = store.create("skill", "gemma4:12b")
 
-    started = asyncio.Event()
-    can_finish = asyncio.Event()
+    assert store.has_worker(session.session_id) is False
 
-    async def slow() -> str:
-        started.set()
-        await can_finish.wait()
-        return "done"
+    finished = asyncio.Event()
 
-    task = asyncio.create_task(slow())
-    store.register_task(session.session_id, task)
+    async def worker() -> None:
+        await finished.wait()
 
-    await started.wait()
-    assert store.is_running(session.session_id) is True
+    task = asyncio.create_task(worker())
+    store.register_worker(session.session_id, task)
+    assert store.has_worker(session.session_id) is True
 
-    can_finish.set()
+    finished.set()
     await task
-    # add_done_callback runs synchronously after await; yield once to let it fire
-    await asyncio.sleep(0)
-    assert store.is_running(session.session_id) is False
-    # Registry was cleaned up by the done callback
-    assert session.session_id not in store._tasks
+    # has_worker reads task.done() so the next check reflects completion
+    assert store.has_worker(session.session_id) is False
 
 
-async def test_is_running_returns_false_for_unknown_session(tmp_path: Path) -> None:
+async def test_is_busy_true_when_mailbox_has_items(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "sessions")
-    assert store.is_running("never-registered") is False
+    session = store.create("skill", "gemma4:12b")
+    mb = store.get_or_create_mailbox(session.session_id)
+    assert store.is_busy(session.session_id) is False
+    await mb.put("work")
+    assert store.is_busy(session.session_id) is True
+
+
+async def test_is_busy_true_when_session_status_running(tmp_path: Path) -> None:
+    """Even with an empty mailbox, status='running' counts as busy."""
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create("skill", "gemma4:12b")
+    session.status = "running"
+    assert store.is_busy(session.session_id) is True
+
+
+async def test_drain_waits_for_mailbox_to_empty(tmp_path: Path) -> None:
+    """drain() returns once every put has been matched by task_done."""
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create("skill", "gemma4:12b")
+    mb = store.get_or_create_mailbox(session.session_id)
+
+    await mb.put("a")
+    await mb.put("b")
+
+    async def consumer() -> None:
+        for _ in range(2):
+            await mb.get()
+            mb.task_done()
+
+    consumer_task = asyncio.create_task(consumer())
+    await asyncio.wait_for(store.drain(session.session_id), timeout=1.0)
+    await consumer_task
+
+
+async def test_drain_unknown_session_is_noop(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    # Must not raise even though there's no mailbox for this id
+    await store.drain("never-touched")
+
+
+async def test_shutdown_cancels_workers_and_clears_registry(
+    tmp_path: Path,
+) -> None:
+    """shutdown() cancels every registered worker and awaits termination."""
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create("skill", "gemma4:12b")
+    mb = store.get_or_create_mailbox(session.session_id)
+
+    # Worker blocks forever on an empty mailbox
+    async def worker() -> None:
+        await mb.get()
+
+    task = asyncio.create_task(worker())
+    store.register_worker(session.session_id, task)
+    # Yield once so the worker actually starts and reaches the await
+    await asyncio.sleep(0)
+    assert store.has_worker(session.session_id) is True
+
+    await store.shutdown()
+    assert task.cancelled()
+    assert store.has_worker(session.session_id) is False
+    # Mailboxes are cleared too so a fresh test/run starts clean
+    assert store.mailbox_depth(session.session_id) == 0
 
 
 def test_touch_updates_last_active_in_cache(tmp_path: Path) -> None:

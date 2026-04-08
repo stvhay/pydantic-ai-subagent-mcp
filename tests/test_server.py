@@ -7,6 +7,7 @@ import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import TracebackType
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,8 +25,17 @@ from pydantic_ai_subagent_mcp.skills import Skill
 
 
 @pytest.fixture(autouse=True)
-def _reset_server_globals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Reset server module globals between tests."""
+async def _reset_server_globals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[None]:
+    """Reset server module globals between tests.
+
+    Async fixture so the teardown can ``await`` the SessionStore's
+    shutdown -- per-session worker tasks block on ``mailbox.get()``
+    between items, and leaving them dangling would emit "Task was
+    destroyed but it is pending!" warnings (and bleed across tests
+    that share the same module-level singletons).
+    """
     monkeypatch.delenv("SUBAGENT_MCP_DEFAULT_MODEL", raising=False)
     monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
     monkeypatch.delenv("SUBAGENT_MCP_STREAMING", raising=False)
@@ -37,6 +47,9 @@ def _reset_server_globals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     server._session_store = None
     server._inbox = None
     server._skills = []
+    yield
+    if server._session_store is not None:
+        await server._session_store.shutdown()
 
 
 def _make_skill(tmp_path: Path, name: str = "test-skill") -> Skill:
@@ -696,22 +709,18 @@ async def test_run_skill_background_returns_immediately(tmp_path: Path) -> None:
         assert result["status"] == "running"
         assert "session_id" in result
         assert "log_path" in result
+        assert "mailbox_depth" in result
         assert "response" not in result  # response only on completion
         session_id = result["session_id"]
 
-        # The store should report the session as busy while the task is in flight
+        # The store should have a worker drain the mailbox
         store = server._get_session_store()
-        assert store.is_running(session_id) is True
+        assert store.has_worker(session_id) is True
 
-        # Let the task finish and verify final state
+        # Let the worker finish processing this item
         can_finish.set()
-        # Drain the registered task so we don't leak it
-        task = store._tasks.get(session_id)
-        if task is not None:
-            await task
-        await asyncio.sleep(0)  # let done callback run
+        await asyncio.wait_for(store.drain(session_id), timeout=1.0)
 
-        assert store.is_running(session_id) is False
         session = store.get(session_id)
         assert session is not None
         assert session.status == "idle"
@@ -719,54 +728,8 @@ async def test_run_skill_background_returns_immediately(tmp_path: Path) -> None:
         assert len(session.messages) == 2
 
 
-async def test_run_skill_resume_busy_session_rejected(tmp_path: Path) -> None:
-    """Resuming a session with an in-flight task returns status='busy'."""
-    skill = _make_skill(tmp_path)
-    can_finish = asyncio.Event()
-
-    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
-        await can_finish.wait()
-        return _make_mock_result()
-
-    with patch.object(server, "_build_agent") as mock_build:
-        mock_agent = AsyncMock()
-        mock_agent.run = AsyncMock(side_effect=blocking_run)
-        mock_build.return_value = mock_agent
-
-        # Start a background run
-        first = await server._run_skill(skill, "first", run_in_background=True)
-        session_id = first["session_id"]
-
-        # Resume attempt while busy must fail-fast — bound it so a regression
-        # (where it blocks on the lock) would surface as TimeoutError
-        second = await asyncio.wait_for(
-            server._run_skill(skill, "second", session_id=session_id),
-            timeout=1.0,
-        )
-        assert second["status"] == "busy"
-        assert second["session_id"] == session_id
-        assert "response" not in second
-
-        # Background resume on the same busy session is also rejected
-        third = await asyncio.wait_for(
-            server._run_skill(
-                skill, "third", session_id=session_id, run_in_background=True
-            ),
-            timeout=1.0,
-        )
-        assert third["status"] == "busy"
-
-        # Drain the original task
-        can_finish.set()
-        store = server._get_session_store()
-        task = store._tasks.get(session_id)
-        if task is not None:
-            await task
-        await asyncio.sleep(0)
-
-
 async def test_run_skill_resume_after_completion_succeeds(tmp_path: Path) -> None:
-    """Once the in-flight task completes, the session is resumable again."""
+    """Once the in-flight item completes, the session is resumable again."""
     skill = _make_skill(tmp_path)
 
     with patch.object(server, "_build_agent") as mock_build:
@@ -781,13 +744,9 @@ async def test_run_skill_resume_after_completion_succeeds(tmp_path: Path) -> Non
         )
         session_id = first["session_id"]
 
-        # Drain the background task
+        # Drain the background work
         store = server._get_session_store()
-        task = store._tasks.get(session_id)
-        assert task is not None
-        await task
-        await asyncio.sleep(0)
-        assert store.is_running(session_id) is False
+        await asyncio.wait_for(store.drain(session_id), timeout=1.0)
 
         # Now a resume should succeed (foreground)
         second = await server._run_skill(
@@ -825,10 +784,9 @@ async def test_run_skill_by_name_background(tmp_path: Path) -> None:
         # Drain
         can_finish.set()
         store = server._get_session_store()
-        task = store._tasks.get(result["session_id"])
-        if task is not None:
-            await task
-        await asyncio.sleep(0)
+        await asyncio.wait_for(
+            store.drain(result["session_id"]), timeout=1.0
+        )
 
 
 async def test_list_sessions_tool_exposes_status(tmp_path: Path) -> None:
@@ -977,10 +935,7 @@ async def test_run_skill_background_emits_notification_on_completion(
 
         can_finish.set()
         store = server._get_session_store()
-        task = store._tasks.get(session_id)
-        assert task is not None
-        await task
-        await asyncio.sleep(0)
+        await asyncio.wait_for(store.drain(session_id), timeout=1.0)
 
         notifications, _ = inbox.read(since="")
         assert len(notifications) == 1
@@ -1039,3 +994,235 @@ async def test_read_inbox_tool_empty_inbox(tmp_path: Path) -> None:
     result = json.loads(await server.read_inbox())
     assert result["notifications"] == []
     assert result["head"] == ""
+
+
+# -- Phase 5: per-session mailbox queue + worker --
+
+
+async def test_resume_busy_session_enqueues_and_runs_in_order(
+    tmp_path: Path,
+) -> None:
+    """Two background pushes to the same session run FIFO without rejection.
+
+    The second push must NOT return status='busy' (Phase 2 behavior);
+    it must enqueue and the worker must process both items in order.
+    The session's message history is the ground truth for ordering.
+    """
+    skill = _make_skill(tmp_path)
+    can_finish_first = asyncio.Event()
+    call_order: list[str] = []
+
+    async def staged_run(*args: Any, **kwargs: Any) -> MagicMock:
+        # First call records "first-start" then waits for the gate.
+        # Second call records "second-start" and returns immediately.
+        history = kwargs.get("message_history") or []
+        label = "first" if not history else "second"
+        call_order.append(f"{label}-start")
+        if label == "first":
+            await can_finish_first.wait()
+        return _make_mock_result(f"{label}-done")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=staged_run)
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        sid = first["session_id"]
+        # First item should be running (mailbox was empty before push)
+        assert first["status"] == "running"
+
+        # Yield so the worker actually picks up the first item and
+        # blocks inside the slow agent call before we push the second.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert "first-start" in call_order
+
+        # Second push must enqueue, not be rejected
+        second = await server._run_skill(
+            skill, "again", session_id=sid, run_in_background=True
+        )
+        assert second["status"] == "queued"
+        assert second["session_id"] == sid
+        assert second["mailbox_depth"] == 1  # one item waiting behind the inflight
+
+        # Release the first item; both should drain in order
+        can_finish_first.set()
+        store = server._get_session_store()
+        await asyncio.wait_for(store.drain(sid), timeout=1.0)
+
+        # FIFO ordering invariant: the worker processed first then second.
+        # (The mock's all_messages() returns a fresh pair on each call so
+        # we can't introspect the cumulative history; call_order is the
+        # ground truth for ordering.)
+        assert call_order == ["first-start", "second-start"]
+        session = store.get(sid)
+        assert session is not None
+        assert session.status == "idle"
+        # mailbox is fully drained
+        assert store.mailbox_depth(sid) == 0
+
+
+async def test_foreground_resume_blocks_until_its_turn(tmp_path: Path) -> None:
+    """A foreground resume on a busy session waits for its enqueued item."""
+    skill = _make_skill(tmp_path)
+    can_finish_first = asyncio.Event()
+
+    async def staged_run(*args: Any, **kwargs: Any) -> MagicMock:
+        history = kwargs.get("message_history") or []
+        if not history:
+            await can_finish_first.wait()
+            return _make_mock_result("first-done")
+        return _make_mock_result("second-done")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=staged_run)
+        mock_build.return_value = mock_agent
+
+        # Background run holds the worker
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        sid = first["session_id"]
+
+        # Foreground resume must enqueue and wait, not return immediately.
+        # We start it as a task so we can verify it's pending.
+        fg_task = asyncio.create_task(
+            server._run_skill(skill, "again", session_id=sid)
+        )
+        # Give the event loop a few ticks; the foreground task should
+        # still be pending because the first item is blocking the worker.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not fg_task.done()
+
+        # Release the first; foreground should now complete with its result
+        can_finish_first.set()
+        result = await asyncio.wait_for(fg_task, timeout=1.0)
+        assert result["status"] == "idle"
+        assert result["response"] == "second-done"
+
+
+async def test_first_background_run_returns_running_not_queued(
+    tmp_path: Path,
+) -> None:
+    """A push to an idle session reports status='running' (not 'queued')."""
+    skill = _make_skill(tmp_path)
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=_make_mock_result())
+        mock_build.return_value = mock_agent
+
+        result = await server._run_skill(skill, "go", run_in_background=True)
+        assert result["status"] == "running"
+        assert result["mailbox_depth"] == 1
+        store = server._get_session_store()
+        await asyncio.wait_for(store.drain(result["session_id"]), timeout=1.0)
+
+
+async def test_skill_mismatch_on_resume_returns_error(tmp_path: Path) -> None:
+    """Resuming a session with a different skill is rejected."""
+    skill_a = _make_skill(tmp_path, name="skill-a")
+    skill_b = _make_skill(tmp_path, name="skill-b")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=_make_mock_result())
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill_a, "go")
+        sid = first["session_id"]
+
+        # Now try to resume the same session with a different skill
+        second = await server._run_skill(skill_b, "go", session_id=sid)
+        assert second["status"] == "skill_mismatch"
+        assert "skill-a" in second["error"]
+        assert "skill-b" in second["error"]
+        # Resume must NOT have run -- only the original turn's messages exist
+        store = server._get_session_store()
+        session = store.get(sid)
+        assert session is not None
+        assert len(session.messages) == 2  # only the first turn
+
+
+async def test_list_sessions_includes_mailbox_depth(tmp_path: Path) -> None:
+    """The list_sessions output exposes the per-session mailbox_depth."""
+    skill = _make_skill(tmp_path)
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        sid = first["session_id"]
+        # Park a second item in the mailbox while the first is in flight
+        await server._run_skill(
+            skill, "again", session_id=sid, run_in_background=True
+        )
+
+        # Yield so the worker has actually picked up the first item;
+        # mailbox_depth then reflects only the queued (not in-flight) item.
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        result_json = await server.list_sessions()
+        listing = json.loads(result_json)
+        entry = next(s for s in listing if s["session_id"] == sid)
+        assert entry["mailbox_depth"] == 1
+        assert entry["status"] == "running"
+
+        # Drain so the fixture teardown is clean
+        can_finish.set()
+        store = server._get_session_store()
+        await asyncio.wait_for(store.drain(sid), timeout=1.0)
+
+
+async def test_worker_lazy_started_on_first_push(tmp_path: Path) -> None:
+    """A worker is created on the first push and survives subsequent pushes."""
+    skill = _make_skill(tmp_path)
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=_make_mock_result())
+        mock_build.return_value = mock_agent
+
+        store = server._get_session_store()
+        first = await server._run_skill(skill, "one", run_in_background=True)
+        sid = first["session_id"]
+        # Worker exists immediately after the first push
+        assert store.has_worker(sid)
+        await asyncio.wait_for(store.drain(sid), timeout=1.0)
+        # Worker is still alive between turns -- it blocks on mailbox.get()
+        assert store.has_worker(sid)
+
+
+async def test_shutdown_drains_workers_no_pending_warnings(
+    tmp_path: Path,
+) -> None:
+    """SessionStore.shutdown() must terminate workers cleanly.
+
+    The fixture teardown calls shutdown() automatically, but exercising
+    it explicitly verifies no 'Task was destroyed but it is pending'
+    warnings appear when the loop tears down.
+    """
+    skill = _make_skill(tmp_path)
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=_make_mock_result())
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        sid = first["session_id"]
+        store = server._get_session_store()
+        await asyncio.wait_for(store.drain(sid), timeout=1.0)
+        assert store.has_worker(sid) is True
+
+        await store.shutdown()
+        assert store.has_worker(sid) is False

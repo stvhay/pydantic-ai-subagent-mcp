@@ -69,11 +69,17 @@ class SessionStore:
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
-        # Registry of in-flight tasks per session_id. Background launches
-        # store their asyncio.Task here so callers can detect "busy"
-        # sessions and reject resume attempts without blocking on the lock.
-        # Tasks remove themselves via add_done_callback when they complete.
-        self._tasks: dict[str, asyncio.Task[Any]] = {}
+        # Per-session mailbox queues. Each session has at most one
+        # ``asyncio.Queue`` of pending work items, drained FIFO by a
+        # dedicated worker task. The actor model: a session is an
+        # addressable mailbox; a resume is a "tell" to that mailbox.
+        self._mailboxes: dict[str, asyncio.Queue[Any]] = {}
+        # Per-session worker tasks. The worker is lazily started on the
+        # first push to the mailbox and lives until ``shutdown()`` is
+        # called (or its loop tears down). One worker per session
+        # guarantees serial execution of that session's turns without
+        # the per-session lock having to do contended work.
+        self._workers: dict[str, asyncio.Task[None]] = {}
 
     def _session_path(self, session_id: str) -> Path:
         return self.session_dir / f"{session_id}.json"
@@ -144,46 +150,112 @@ class SessionStore:
         return session
 
     def list_sessions(self) -> list[dict[str, Any]]:
-        """List all session IDs and metadata."""
+        """List all session IDs and metadata.
+
+        ``mailbox_depth`` reflects in-memory queued work for the session
+        (server-local; not persisted on disk). It is 0 for any session
+        whose mailbox has never been touched in the current process,
+        even if the on-disk record exists.
+        """
         sessions: list[dict[str, Any]] = []
         for path in self.session_dir.glob("*.json"):
             try:
                 data = json.loads(path.read_text())
+                sid = data["session_id"]
                 sessions.append({
-                    "session_id": data["session_id"],
+                    "session_id": sid,
                     "skill_name": data["skill_name"],
                     "model": data["model"],
                     "created_at": data["created_at"],
                     "status": data.get("status", "idle"),
                     "last_active": data.get("last_active", data["created_at"]),
                     "message_count": len(data.get("messages", [])),
+                    "mailbox_depth": self.mailbox_depth(sid),
                 })
             except (json.JSONDecodeError, KeyError):
                 continue
         return sessions
 
-    # -- task registry (for run_in_background) --
+    # -- mailbox + worker registry (for the actor model) --
 
-    def register_task(
-        self, session_id: str, task: asyncio.Task[Any]
+    def get_or_create_mailbox(self, session_id: str) -> asyncio.Queue[Any]:
+        """Return the per-session mailbox, creating it lazily if absent.
+
+        The contained item type is intentionally ``Any`` here so the
+        store does not have to import the server-side ``_WorkItem``
+        dataclass; the worker that drains the queue knows what to expect.
+        """
+        mb = self._mailboxes.get(session_id)
+        if mb is None:
+            mb = asyncio.Queue()
+            self._mailboxes[session_id] = mb
+        return mb
+
+    def mailbox_depth(self, session_id: str) -> int:
+        """Return the number of pending work items in the session's mailbox.
+
+        This counts only *queued* items, not the in-flight one. A session
+        with one item being processed and nothing else queued has
+        ``mailbox_depth == 0`` and ``status == "running"``.
+        """
+        mb = self._mailboxes.get(session_id)
+        return mb.qsize() if mb is not None else 0
+
+    def has_worker(self, session_id: str) -> bool:
+        """Return True if a live worker task exists for this session."""
+        worker = self._workers.get(session_id)
+        return worker is not None and not worker.done()
+
+    def register_worker(
+        self, session_id: str, worker: asyncio.Task[None]
     ) -> None:
-        """Track a background task for a session.
+        """Track a session worker task. Replaces any prior dead worker."""
+        self._workers[session_id] = worker
 
-        The task removes itself via ``add_done_callback`` when complete,
-        so the registry stays bounded by the number of in-flight runs.
+    def is_busy(self, session_id: str) -> bool:
+        """True if the session has queued work or a turn currently running.
+
+        Used by callers and observers to decide whether a freshly
+        enqueued item will run immediately ("running") or wait behind
+        existing work ("queued"). The check is best-effort: between the
+        snapshot and the next event-loop tick the worker may have
+        advanced, but the value is purely informational.
         """
-        self._tasks[session_id] = task
-        task.add_done_callback(lambda _t: self._tasks.pop(session_id, None))
+        if self.mailbox_depth(session_id) > 0:
+            return True
+        session = self._sessions.get(session_id)
+        return session is not None and session.status == "running"
 
-    def is_running(self, session_id: str) -> bool:
-        """Return True if a tracked task for this session is still in flight.
+    async def drain(self, session_id: str) -> None:
+        """Wait for all queued items in the session's mailbox to complete.
 
-        Used by callers to fail-fast on resume attempts against a busy
-        session without blocking on the per-session lock. Phase 5 will
-        replace this fail-fast with a proper mailbox queue.
+        Tests use this to synchronize on background work without polling.
+        Returns immediately if the session has no mailbox or the
+        mailbox is already empty and idle.
         """
-        task = self._tasks.get(session_id)
-        return task is not None and not task.done()
+        mb = self._mailboxes.get(session_id)
+        if mb is not None:
+            await mb.join()
+
+    async def shutdown(self) -> None:
+        """Cancel every session worker and await its termination.
+
+        Called from test fixtures and from the server's shutdown path
+        to avoid leaking pending tasks across event loops. Workers
+        block on ``mailbox.get()`` between items, so cancellation
+        unblocks them cleanly. Items already in flight inside
+        ``_execute_skill_turn`` will receive ``CancelledError`` and
+        the streaming-log "cancelled" trailer / inbox notification
+        paths will fire on the way out.
+        """
+        workers = list(self._workers.values())
+        for w in workers:
+            w.cancel()
+        for w in workers:
+            with suppress(asyncio.CancelledError, Exception):
+                await w
+        self._workers.clear()
+        self._mailboxes.clear()
 
     def touch(self, session_id: str) -> None:
         """Bump ``last_active`` to now for an in-cache session.
