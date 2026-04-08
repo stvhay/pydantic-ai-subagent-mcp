@@ -12,7 +12,6 @@ def test_default_config():
     config = ServerConfig()
     assert config.ollama_base_url == "http://localhost:11434"
     assert config.default_model == "gemma4:12b"
-    assert config.srclight_enabled is True
 
 
 def test_load_from_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
