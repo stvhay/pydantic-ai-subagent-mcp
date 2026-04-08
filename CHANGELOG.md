@@ -11,6 +11,7 @@
 ### Added
 
 - Per-turn completion trailer (`--- end ok ---` / `--- end error ---` / `--- end cancelled ---`) on streaming session logs so tail clients can detect completion, errors, and client-disconnect cancellation (#8).
+- Streaming unit tests closing the D1 (resume-from-disk multi-turn) and D3 (concurrent tail mid-stream) coverage gaps from the #4 final integration review. D2 (mid-stream error) was already covered by the trailer tests added in #8 (#11).
 - Streaming skill execution via `agent.run_stream()`, gated by a new `streaming: bool` config field (default `true`) with `SUBAGENT_MCP_STREAMING` env override
 - Per-session append-only `{session_dir}/{session_id}.log` files capturing text deltas with a `--- prompt ---` / `--- response ---` transcript format
 - New `tail_session_log(session_id, offset)` MCP tool for offset-based polling of live stream output
