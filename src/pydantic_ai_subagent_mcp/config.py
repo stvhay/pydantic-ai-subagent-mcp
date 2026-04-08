@@ -16,6 +16,7 @@ class ServerConfig:
     ollama_base_url: str = "http://localhost:11434"
     default_model: str = "gemma4:12b"
     session_dir: str = ".subagent-sessions"
+    inbox_dir: str = ".subagent-inbox"
     max_iterations: int = 50
     tool_timeout: float = 120.0
     srclight_enabled: bool = True
@@ -49,6 +50,7 @@ class ServerConfig:
                 data.get("default_model", cls.default_model),
             ),
             session_dir=data.get("session_dir", cls.session_dir),
+            inbox_dir=data.get("inbox_dir", cls.inbox_dir),
             max_iterations=int(data.get("max_iterations", cls.max_iterations)),
             tool_timeout=float(data.get("tool_timeout", cls.tool_timeout)),
             srclight_enabled=data.get("srclight_enabled", cls.srclight_enabled),

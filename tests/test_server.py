@@ -31,9 +31,11 @@ def _reset_server_globals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.delenv("SUBAGENT_MCP_STREAMING", raising=False)
     server._config = ServerConfig(
         session_dir=str(tmp_path / "sessions"),
+        inbox_dir=str(tmp_path / "inbox"),
         streaming=False,
     )
     server._session_store = None
+    server._inbox = None
     server._skills = []
 
 
@@ -42,6 +44,25 @@ def _make_skill(tmp_path: Path, name: str = "test-skill") -> Skill:
     md = tmp_path / f"{name}.md"
     md.write_text(f"# {name}\n\nA test skill.\n")
     return Skill(name=name, description="A test skill", source_path=md)
+
+
+def _override_streaming_config(tmp_path: Path) -> None:
+    """Switch the server config into streaming mode for one test.
+
+    Resets every server-level singleton (config, session store, inbox)
+    so each call yields a fresh, fully isolated state pointed at
+    ``tmp_path``. Tests that need streaming mode should call this in
+    place of mutating ``server._config`` directly — without resetting
+    ``_inbox``, completion notifications would leak into the real
+    ``.subagent-inbox/`` directory in the project root.
+    """
+    server._config = ServerConfig(
+        session_dir=str(tmp_path / "sessions"),
+        inbox_dir=str(tmp_path / "inbox"),
+        streaming=True,
+    )
+    server._session_store = None
+    server._inbox = None
 
 
 def _make_mock_result(output: str = "Hello from the agent!") -> MagicMock:
@@ -308,11 +329,7 @@ def _make_failing_stream(
 
 async def test_run_skill_streaming_writes_log(tmp_path: Path) -> None:
     """With streaming=True, _run_skill writes deltas to the session log file."""
-    server._config = ServerConfig(
-        session_dir=str(tmp_path / "sessions"),
-        streaming=True,
-    )
-    server._session_store = None  # force rebuild with new config
+    _override_streaming_config(tmp_path)
 
     skill = _make_skill(tmp_path)
     chunks = ["Hello", " from", " the", " agent!"]
@@ -343,11 +360,7 @@ async def test_run_skill_streaming_writes_log(tmp_path: Path) -> None:
 
 async def test_run_skill_streaming_multi_turn_appends(tmp_path: Path) -> None:
     """Each turn appends a new prompt/response block to the same log."""
-    server._config = ServerConfig(
-        session_dir=str(tmp_path / "sessions"),
-        streaming=True,
-    )
-    server._session_store = None
+    _override_streaming_config(tmp_path)
 
     skill = _make_skill(tmp_path)
 
@@ -406,11 +419,7 @@ async def test_run_skill_streaming_writes_ok_trailer(tmp_path: Path) -> None:
 
     Tests issue #8 acceptance criterion 1.
     """
-    server._config = ServerConfig(
-        session_dir=str(tmp_path / "sessions"),
-        streaming=True,
-    )
-    server._session_store = None  # force rebuild with new config
+    _override_streaming_config(tmp_path)
 
     skill = _make_skill(tmp_path)
     chunks = ["Hello", " world"]
@@ -442,11 +451,7 @@ async def test_run_skill_streaming_writes_error_trailer_and_propagates(
     The exception surfaces via _run_skill's error response.
     Tests issue #8 acceptance criterion 2.
     """
-    server._config = ServerConfig(
-        session_dir=str(tmp_path / "sessions"),
-        streaming=True,
-    )
-    server._session_store = None
+    _override_streaming_config(tmp_path)
 
     skill = _make_skill(tmp_path)
     boom = RuntimeError("ollama vanished")
@@ -481,11 +486,7 @@ async def test_run_skill_streaming_error_trailer_sanitizes_newlines(
 
     Ensures the trailer stays on a single line.
     """
-    server._config = ServerConfig(
-        session_dir=str(tmp_path / "sessions"),
-        streaming=True,
-    )
-    server._session_store = None
+    _override_streaming_config(tmp_path)
 
     skill = _make_skill(tmp_path)
     boom = ValueError("line one\nline two\rline three")
@@ -521,11 +522,7 @@ async def test_run_skill_streaming_cancelled_writes_cancelled_trailer(
     so it propagates past _run_skill's outer error handler. The trailer must
     still be written before the exception escapes _run_skill_streaming.
     """
-    server._config = ServerConfig(
-        session_dir=str(tmp_path / "sessions"),
-        streaming=True,
-    )
-    server._session_store = None
+    _override_streaming_config(tmp_path)
 
     skill = _make_skill(tmp_path)
     cancelled = asyncio.CancelledError()
@@ -847,3 +844,198 @@ async def test_list_sessions_tool_exposes_status(tmp_path: Path) -> None:
     assert len(result) == 1
     assert result[0]["status"] == "running"
     assert result[0]["last_active"] == "2026-04-08T10:00:00+00:00"
+
+
+# -- Phase 3: inbox notifications + read_inbox tool --
+
+
+async def test_run_skill_emits_ok_notification_on_success(tmp_path: Path) -> None:
+    """A successful turn writes an 'ok' notification with the response summary."""
+    skill = _make_skill(tmp_path)
+    mock_result = _make_mock_result("agent said hi")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=mock_result)
+        mock_build.return_value = mock_agent
+
+        result = await server._run_skill(skill, "hello")
+
+    inbox = server._get_inbox()
+    notifications, _ = inbox.read(since="")
+    assert len(notifications) == 1
+    n = notifications[0]
+    assert n["session_id"] == result["session_id"]
+    assert n["status"] == "ok"
+    assert n["skill"] == skill.name
+    assert n["summary"] == "agent said hi"
+
+
+async def test_run_skill_emits_error_notification_on_exception(
+    tmp_path: Path,
+) -> None:
+    """An exception during the turn writes an 'error' notification."""
+    skill = _make_skill(tmp_path)
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=RuntimeError("boom"))
+        mock_build.return_value = mock_agent
+
+        result = await server._run_skill(skill, "hello")
+
+    inbox = server._get_inbox()
+    notifications, _ = inbox.read(since="")
+    assert len(notifications) == 1
+    n = notifications[0]
+    assert n["session_id"] == result["session_id"]
+    assert n["status"] == "error"
+    assert "boom" in n["summary"]
+
+
+async def test_run_skill_emits_cancelled_notification_on_basexception(
+    tmp_path: Path,
+) -> None:
+    """CancelledError writes a 'cancelled' notification before propagating.
+
+    Streaming mode is required to trigger the BaseException path
+    (CancelledError raised mid-stream — see existing test for the
+    cancelled trailer behavior).
+    """
+    _override_streaming_config(tmp_path)
+
+    skill = _make_skill(tmp_path)
+    cancelled = asyncio.CancelledError()
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = MagicMock()
+        mock_agent.run_stream = MagicMock(
+            return_value=_make_failing_stream(["partial"], cancelled)
+        )
+        mock_build.return_value = mock_agent
+
+        with pytest.raises(asyncio.CancelledError):
+            await server._run_skill(skill, "go")
+
+    inbox = server._get_inbox()
+    notifications, _ = inbox.read(since="")
+    assert len(notifications) == 1
+    n = notifications[0]
+    assert n["status"] == "cancelled"
+    assert "CancelledError" in n["summary"]
+
+
+async def test_inbox_write_failure_does_not_mask_run_result(
+    tmp_path: Path,
+) -> None:
+    """If the inbox write itself raises, the run still returns its response."""
+    skill = _make_skill(tmp_path)
+    mock_result = _make_mock_result("agent succeeded")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=mock_result)
+        mock_build.return_value = mock_agent
+
+        # Make Inbox.write raise unconditionally
+        def boom(*args: object, **kwargs: object) -> None:
+            raise OSError("inbox volume full")
+
+        with patch.object(server._get_inbox(), "write", side_effect=boom):
+            result = await server._run_skill(skill, "go")
+
+    # The agent's response is preserved despite the inbox failure
+    assert "error" not in result
+    assert result["response"] == "agent succeeded"
+    assert result["status"] == "idle"
+
+
+async def test_run_skill_background_emits_notification_on_completion(
+    tmp_path: Path,
+) -> None:
+    """A background run still writes a notification when its task finishes."""
+    skill = _make_skill(tmp_path)
+    can_finish = asyncio.Event()
+
+    async def blocking_run(*_a: object, **_k: object) -> MagicMock:
+        await can_finish.wait()
+        return _make_mock_result("background ok")
+
+    with patch.object(server, "_build_agent") as mock_build:
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(side_effect=blocking_run)
+        mock_build.return_value = mock_agent
+
+        first = await server._run_skill(skill, "go", run_in_background=True)
+        session_id = first["session_id"]
+        assert first["status"] == "running"
+
+        # Inbox is empty until the background task completes
+        inbox = server._get_inbox()
+        notifications, _ = inbox.read(since="")
+        assert notifications == []
+
+        can_finish.set()
+        store = server._get_session_store()
+        task = store._tasks.get(session_id)
+        assert task is not None
+        await task
+        await asyncio.sleep(0)
+
+        notifications, _ = inbox.read(since="")
+        assert len(notifications) == 1
+        assert notifications[0]["status"] == "ok"
+        assert notifications[0]["session_id"] == session_id
+        assert notifications[0]["summary"] == "background ok"
+
+
+async def test_read_inbox_tool_returns_records_and_head(tmp_path: Path) -> None:
+    """read_inbox MCP tool returns the {notifications, head} JSON shape."""
+    inbox = server._get_inbox()
+    n = inbox.write(
+        session_id="s1",
+        skill="skill",
+        model="m",
+        status="ok",
+        summary="hello",
+    )
+
+    result_json = await server.read_inbox()
+    result = json.loads(result_json)
+    assert "notifications" in result
+    assert "head" in result
+    assert len(result["notifications"]) == 1
+    assert result["notifications"][0]["notification_id"] == n.notification_id
+    assert result["head"] == n.notification_id
+
+
+async def test_read_inbox_tool_advances_with_cursor(tmp_path: Path) -> None:
+    """Passing the previous head as 'since' returns only newer records."""
+    inbox = server._get_inbox()
+    first = inbox.write(
+        session_id="s1", skill="k", model="m", status="ok", summary="one"
+    )
+
+    initial = json.loads(await server.read_inbox(since=""))
+    assert initial["head"] == first.notification_id
+
+    # No new records yet — cursor should not advance
+    second = json.loads(await server.read_inbox(since=initial["head"]))
+    assert second["notifications"] == []
+    assert second["head"] == initial["head"]
+
+    # Write more, then drain forward
+    second_n = inbox.write(
+        session_id="s2", skill="k", model="m", status="error", summary="boom"
+    )
+    third = json.loads(await server.read_inbox(since=initial["head"]))
+    assert len(third["notifications"]) == 1
+    assert third["notifications"][0]["notification_id"] == second_n.notification_id
+    assert third["head"] == second_n.notification_id
+
+
+async def test_read_inbox_tool_empty_inbox(tmp_path: Path) -> None:
+    """read_inbox on an empty inbox returns empty notifications and empty head."""
+    result = json.loads(await server.read_inbox())
+    assert result["notifications"] == []
+    assert result["head"] == ""

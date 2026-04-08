@@ -19,6 +19,7 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.ollama import OllamaProvider
 
 from .config import ServerConfig
+from .inbox import Inbox
 from .session import Session, SessionStore
 from .skills import Skill, discover_skills
 from .tools import BUILTIN_TOOLS
@@ -28,6 +29,7 @@ logger = logging.getLogger("subagent-mcp")
 # Global state initialized at startup
 _config: ServerConfig | None = None
 _session_store: SessionStore | None = None
+_inbox: Inbox | None = None
 _skills: list[Skill] = []
 
 
@@ -61,6 +63,13 @@ def _get_session_store() -> SessionStore:
     if _session_store is None:
         _session_store = SessionStore(_get_config().session_dir)
     return _session_store
+
+
+def _get_inbox() -> Inbox:
+    global _inbox
+    if _inbox is None:
+        _inbox = Inbox(_get_config().inbox_dir)
+    return _inbox
 
 
 def _build_model(model_name: str | None = None) -> OpenAIChatModel:
@@ -188,6 +197,36 @@ async def _run_skill_streaming(
     return output, messages
 
 
+def _emit_notification(
+    session: Session,
+    skill: Skill,
+    status: str,
+    summary: str,
+) -> None:
+    """Best-effort write of a completion notification to the inbox.
+
+    Inbox writes must never mask the caller's exit path: they are
+    swallowed via the module logger if anything goes wrong. The inbox
+    is a separate file per record so a failed write does not corrupt
+    the rest of the inbox. ``status`` is the inbox vocabulary
+    (``ok``/``error``/``cancelled``), which mirrors the streaming-log
+    trailer so observers can correlate.
+    """
+    try:
+        _get_inbox().write(
+            session_id=session.session_id,
+            skill=skill.name,
+            model=session.model,
+            status=status,  # type: ignore[arg-type]
+            summary=summary,
+        )
+    except Exception:  # noqa: BLE001 — best-effort; never mask the run result
+        logger.exception(
+            "failed to write inbox notification for session %s",
+            session.session_id,
+        )
+
+
 async def _execute_skill_turn(
     skill: Skill,
     prompt: str,
@@ -202,9 +241,14 @@ async def _execute_skill_turn(
     any exception or cancellation it flips to ``failed``. ``last_active``
     is bumped at every transition.
 
+    A completion notification is written to the inbox on every exit
+    path (``ok`` / ``error`` / ``cancelled``) so external observers
+    (the Phase 4 hook bridge, ``read_inbox`` callers) can detect
+    completion without polling the session JSON.
+
     ``CancelledError`` (and any other ``BaseException``) propagates so
-    cancellation tears down cleanly, but the failed status is persisted
-    first on a best-effort basis.
+    cancellation tears down cleanly, but the failed status and the
+    cancelled notification are persisted first on a best-effort basis.
     """
     store = _get_session_store()
     config = _get_config()
@@ -235,6 +279,7 @@ async def _execute_skill_turn(
                 store.save(session)
             error_msg = f"Error running skill '{skill.name}': {e}"
             logger.exception(error_msg)
+            _emit_notification(session, skill, "error", str(e))
             return {
                 "session_id": session.session_id,
                 "error": error_msg,
@@ -242,7 +287,7 @@ async def _execute_skill_turn(
                 "skill": skill.name,
                 "status": "failed",
             }
-        except BaseException:
+        except BaseException as e:
             # CancelledError, KeyboardInterrupt, SystemExit. Persist a
             # failed status so the session is not stuck on "running"
             # forever, then re-raise so the runtime tears down cleanly.
@@ -250,12 +295,16 @@ async def _execute_skill_turn(
             session.last_active = datetime.now(UTC).isoformat()
             with suppress(Exception):
                 store.save(session)
+            _emit_notification(
+                session, skill, "cancelled", f"{type(e).__name__}: {e}"
+            )
             raise
 
         session.messages = messages
         session.status = "idle"
         session.last_active = datetime.now(UTC).isoformat()
         store.save(session)
+        _emit_notification(session, skill, "ok", output)
 
         return {
             "session_id": session.session_id,
@@ -405,6 +454,31 @@ async def tail_session_log(session_id: str, offset: int = 0) -> str:
 
 
 @mcp_server.tool(
+    name="read_inbox",
+    description=(
+        "Drain new completion notifications from the subagent inbox. "
+        "Pass since='' on the first call to receive the most recent "
+        "notifications (up to limit), then feed back the returned "
+        "'head' as 'since' on subsequent calls to advance the cursor "
+        "and receive only newer records. Returns JSON with "
+        "'notifications' (list of completion records) and 'head' "
+        "(the latest notification_id seen, or the input 'since' if no "
+        "new records). Each notification carries session_id, skill, "
+        "model, status (ok/error/cancelled), timestamp, and a short "
+        "summary -- use get_session_transcript with the session_id "
+        "for the full structured history."
+    ),
+)
+async def read_inbox(since: str = "", limit: int = 50) -> str:
+    inbox = _get_inbox()
+    notifications, head = inbox.read(since=since, limit=limit)
+    return json.dumps(
+        {"notifications": notifications, "head": head},
+        indent=2,
+    )
+
+
+@mcp_server.tool(
     name="run_skill_by_name",
     description=(
         "Run any skill by name with a prompt. Use this when you know the skill name "
@@ -451,10 +525,11 @@ async def _check_ollama(config: ServerConfig) -> None:
 
 def _initialize() -> None:
     """Discover skills and register them as MCP tools at startup."""
-    global _skills, _config, _session_store
+    global _skills, _config, _session_store, _inbox
 
     _config = ServerConfig.load()
     _session_store = SessionStore(_config.session_dir)
+    _inbox = Inbox(_config.inbox_dir)
 
     logger.info("Discovering skills...")
     _skills = discover_skills()

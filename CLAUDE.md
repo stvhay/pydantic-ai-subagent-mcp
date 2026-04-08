@@ -25,7 +25,7 @@ uv run mypy src/           # Type check
 
 ## Conventions
 
-- Python 3.13+ (targeting 3.14 via Nix flake)
+- Python 3.14+ (required for `uuid.uuid7()`)
 - Use `uv` for package management, never pip directly
 - Type annotations required; `mypy --strict` must pass
 - Ruff for linting and formatting
