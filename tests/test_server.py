@@ -46,10 +46,12 @@ async def _reset_server_globals(
         session_dir=str(tmp_path / "sessions"),
         inbox_dir=str(tmp_path / "inbox"),
         streaming=False,
+        mcp_servers_config=str(tmp_path / "missing-mcp-servers.json"),
     )
     server._session_store = None
     server._inbox = None
     server._skills = []
+    server._mcp_toolsets = []
     yield
     if server._session_store is not None:
         await server._session_store.shutdown()
@@ -76,6 +78,7 @@ def _override_streaming_config(tmp_path: Path) -> None:
         session_dir=str(tmp_path / "sessions"),
         inbox_dir=str(tmp_path / "inbox"),
         streaming=True,
+        mcp_servers_config=str(tmp_path / "missing-mcp-servers.json"),
     )
     server._session_store = None
     server._inbox = None
@@ -105,6 +108,82 @@ def test_build_model_uses_config_default() -> None:
 def test_build_agent(tmp_path: Path) -> None:
     skill = _make_skill(tmp_path)
     agent = server._build_agent(skill)
+    assert agent is not None
+
+
+def test_load_mcp_toolsets_missing_file_returns_empty(tmp_path: Path) -> None:
+    """A missing MCP servers config is not an error -- the loader returns []."""
+    config = ServerConfig(
+        mcp_servers_config=str(tmp_path / "does-not-exist.json"),
+    )
+    assert server._load_mcp_toolsets(config) == []
+
+
+def test_load_mcp_toolsets_malformed_file_returns_empty(tmp_path: Path) -> None:
+    """A malformed config file is logged and treated as empty, not fatal."""
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not valid json")
+    config = ServerConfig(mcp_servers_config=str(bad))
+    assert server._load_mcp_toolsets(config) == []
+
+
+def test_load_mcp_toolsets_loads_stdio_server(tmp_path: Path) -> None:
+    """A valid config produces an MCPServerStdio with id/tool_prefix set."""
+    cfg = tmp_path / "servers.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "echo": {
+                        "command": "echo",
+                        "args": ["hello"],
+                    }
+                }
+            }
+        )
+    )
+    config = ServerConfig(mcp_servers_config=str(cfg))
+    toolsets = server._load_mcp_toolsets(config)
+    assert len(toolsets) == 1
+    assert toolsets[0].id == "echo"
+    assert toolsets[0].tool_prefix == "echo"
+
+
+def test_load_mcp_toolsets_shipped_example_loads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The .subagent-mcp.servers.json.example we ship must round-trip cleanly.
+
+    pydantic-ai's `_expand_env_vars` recursively walks the entire JSON
+    document and tries to expand every `${...}` reference. A stray
+    documentation string like `${VAR}` inside a `_comment` field will
+    raise `ValueError` and silently disable the toolset injection path,
+    so the example file must contain only real env-var references that
+    actually exist at load time.
+    """
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("HOME", "/tmp/fake-home")
+    example_path = Path(__file__).resolve().parent.parent / (
+        ".subagent-mcp.servers.json.example"
+    )
+    assert example_path.exists(), (
+        f"shipped example file missing at {example_path}"
+    )
+    config = ServerConfig(mcp_servers_config=str(example_path))
+    toolsets = server._load_mcp_toolsets(config)
+    assert len(toolsets) >= 1
+    names = [getattr(s, "id", None) for s in toolsets]
+    assert "srclight" in names
+
+
+def test_build_agent_passes_toolsets(tmp_path: Path) -> None:
+    """_build_agent forwards the toolsets list to the underlying Agent."""
+    skill = _make_skill(tmp_path)
+    sentinel: list[Any] = []
+    agent = server._build_agent(skill, toolsets=sentinel)
+    # The Agent stores the user-supplied toolsets; we don't peek at the
+    # internal field directly because the API is private. The test just
+    # asserts the call doesn't raise and produces a usable agent.
     assert agent is not None
 
 

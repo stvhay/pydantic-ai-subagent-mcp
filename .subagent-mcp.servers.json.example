@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "srclight": {
+      "command": "uv",
+      "args": ["run", "srclight", "serve", "--transport", "stdio"],
+      "env": {
+        "PATH": "${PATH}",
+        "HOME": "${HOME}"
+      }
+    }
+  }
+}

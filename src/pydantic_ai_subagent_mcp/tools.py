@@ -87,16 +87,6 @@ async def shell_exec(ctx: RunContext[None], command: str, timeout: float = 60.0)
         return f"Error executing command: {e}"
 
 
-async def web_search(ctx: RunContext[None], query: str) -> str:
-    """Search the web. Requires an available search tool or API."""
-    # This is a placeholder -- in production, integrate with a search API
-    # or delegate to srclight/other MCP tools
-    return (
-        f"Web search for '{query}' is not yet configured. "
-        "Configure a search API endpoint in .subagent-mcp.json"
-    )
-
-
 # Registry of all built-in tools
 BUILTIN_TOOLS = [
     read_file,
@@ -104,5 +94,4 @@ BUILTIN_TOOLS = [
     list_files,
     search_files,
     shell_exec,
-    web_search,
 ]

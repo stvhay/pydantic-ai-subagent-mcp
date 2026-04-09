@@ -6,6 +6,7 @@
 
 ### Added
 
+- External MCP server tool injection: subagents now expose tools from any MCP server declared in `.subagent-mcp.servers.json` (configurable via the new `mcp_servers_config` field in `.subagent-mcp.json`). The file uses the standard `{"mcpServers": {<name>: {command, args, env}}}` shape consumed by `pydantic_ai.mcp.load_mcp_servers`, with `${VAR}` / `${VAR:-default}` env-var expansion. Each subagent run wraps the agent in `async with agent:` so server subprocesses are started fresh per turn and torn down on exit. A missing or malformed config is logged and treated as empty so the server still boots. Ships with `.subagent-mcp.servers.json.example` showing srclight pre-wired (#5).
 - Asynchronous / background skill runs via `run_in_background=true` on `run_skill_by_name` (and the per-skill `skill_*` tools). A background launch enqueues a work item on the session's mailbox and returns immediately with `status` of `running` or `queued`; foreground (Ask mode) callers still block on their own turn (#19).
 - Per-session actor model: each session owns a mailbox (`asyncio.Queue`) drained FIFO by a single long-lived worker task. Concurrent resumes to the same session enqueue in submission order rather than rejecting, and distinct sessions run on independent workers (#19).
 - `stop_session(session_id)` MCP tool that drains queued mailbox items, cancels the in-flight turn, and tears down the session's worker and mailbox. Returns `{status, in_flight_cancelled, queued_dropped}`. Idempotent: safe to call on an already-idle, not-found, or just-stopped session. A cancelled turn writes a `cancelled` trailer to the session log and a `cancelled` notification to the inbox on the way out (#19).
@@ -34,11 +35,13 @@
 ### Changed
 
 - Skill discovery now reads modern Claude Code `SKILL.md` files instead of loose markdown slash commands. A skill is a directory containing `SKILL.md` whose first block is YAML frontmatter declaring at least `name` (and optionally `description`); unknown frontmatter keys (e.g. `model`, `effort`, `context`) are tolerated so benchmark-style skills load cleanly. The default search order is `./.claude/skills/` → `~/.claude/skills/` → every installed plugin under `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/skills/`, with name-collision dedup so earlier dirs win. Plugin attribution is recovered from the cache path. Adds a `pyyaml` runtime dependency (and `types-PyYAML` for dev). Existing `.claude/commands/*.md` slash commands are no longer picked up — migrate them to `.claude/skills/<name>/SKILL.md` with frontmatter.
+- Default model bumped from `gemma4:12b` to `gemma4:26b`. The 26B Gemma 4 variant handles tool calling and multi-turn skill execution more reliably than the smaller 12B model, which matters now that subagents can pull tools from external MCP servers (#5). Existing `.subagent-mcp.json` files that pin `default_model` are unaffected; only the fallback default changed.
 - Document mid-stream staleness of `get_session_transcript` in `docs/DESIGN.md`; cross-link `get_session_transcript` and `tail_session_log` MCP tool descriptions so LLM callers pick the right one (#9).
 - `run_skill_by_name` now resolves the skill via `next(...)` instead of building an intermediate list, a small readability cleanup with no behavior change.
 
 ### Removed
 
+- Placeholder `web_search` built-in tool. It returned a hard-coded "not yet configured" string and only existed as a stub for future search-API integration; now that subagents can pull tools from any external MCP server (see Added → MCP server tool injection), wiring up a real search server through `.subagent-mcp.servers.json` is the supported path. Existing call sites (none in production code) need no migration -- just remove the import.
 - Dead config knobs `max_iterations`, `tool_timeout`, and `srclight_enabled` from `ServerConfig`. They were declared, defaulted, and parsed from `.subagent-mcp.json` but never read by any production code path. The `srclight` MCP server is still listed as a dependency (and remains usable when wired through `.mcp.json`); only the unused config flag is gone. Existing `.subagent-mcp.json` files that still set these keys keep working — unknown keys are silently ignored by the loader — but the keys no longer do anything and can be deleted.
 
 ### Fixed
