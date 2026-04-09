@@ -33,6 +33,7 @@
 
 ### Changed
 
+- Skill discovery now reads modern Claude Code `SKILL.md` files instead of loose markdown slash commands. A skill is a directory containing `SKILL.md` whose first block is YAML frontmatter declaring at least `name` (and optionally `description`); unknown frontmatter keys (e.g. `model`, `effort`, `context`) are tolerated so benchmark-style skills load cleanly. The default search order is `./.claude/skills/` → `~/.claude/skills/` → every installed plugin under `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/skills/`, with name-collision dedup so earlier dirs win. Plugin attribution is recovered from the cache path. Adds a `pyyaml` runtime dependency (and `types-PyYAML` for dev). Existing `.claude/commands/*.md` slash commands are no longer picked up — migrate them to `.claude/skills/<name>/SKILL.md` with frontmatter.
 - Document mid-stream staleness of `get_session_transcript` in `docs/DESIGN.md`; cross-link `get_session_transcript` and `tail_session_log` MCP tool descriptions so LLM callers pick the right one (#9).
 - `run_skill_by_name` now resolves the skill via `next(...)` instead of building an intermediate list, a small readability cleanup with no behavior change.
 
