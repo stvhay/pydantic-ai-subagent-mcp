@@ -10,14 +10,22 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, TextIO
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic_ai import Agent
+from pydantic_ai.mcp import (
+    MCPServerSSE,
+    MCPServerStdio,
+    MCPServerStreamableHTTP,
+    load_mcp_servers,
+)
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.ollama import OllamaProvider
+from pydantic_ai.toolsets import AbstractToolset
 
 from .config import ServerConfig
 from .inbox import Inbox
@@ -27,11 +35,15 @@ from .tools import BUILTIN_TOOLS
 
 logger = logging.getLogger("subagent-mcp")
 
+# Type alias for the union returned by pydantic-ai's load_mcp_servers
+_MCPServer = MCPServerStdio | MCPServerStreamableHTTP | MCPServerSSE
+
 # Global state initialized at startup
 _config: ServerConfig | None = None
 _session_store: SessionStore | None = None
 _inbox: Inbox | None = None
 _skills: list[Skill] = []
+_mcp_toolsets: list[_MCPServer] = []
 
 
 @asynccontextmanager
@@ -87,8 +99,58 @@ def _build_model(model_name: str | None = None) -> OpenAIChatModel:
     )
 
 
-def _build_agent(skill: Skill, model_name: str | None = None) -> Agent[None, str]:
-    """Build a pydantic-ai agent for a skill with built-in tools."""
+def _load_mcp_toolsets(config: ServerConfig) -> list[_MCPServer]:
+    """Load external MCP servers declared in ``config.mcp_servers_config``.
+
+    Returns an empty list when the file is missing -- subagents still
+    boot, they simply have no external MCP tools beyond ``BUILTIN_TOOLS``.
+    A malformed config file is logged and treated as empty so a typo in
+    the JSON cannot prevent the server from starting.
+
+    Each returned server is a long-lived ``MCPServer`` instance whose
+    subprocess (or HTTP client) lifetime is managed by the agent's
+    async context manager: callers must wrap agent runs in
+    ``async with agent:`` so the toolset is entered/exited around the
+    actual run.
+    """
+    config_path = Path(config.mcp_servers_config)
+    if not config_path.exists():
+        logger.info(
+            "No MCP servers config at %s; subagents will run with built-in tools only",
+            config_path,
+        )
+        return []
+    try:
+        servers = load_mcp_servers(config_path)
+    except Exception:
+        logger.exception(
+            "Failed to load MCP servers config from %s; "
+            "subagents will run with built-in tools only",
+            config_path,
+        )
+        return []
+    logger.info(
+        "Loaded %d MCP server(s) from %s: %s",
+        len(servers),
+        config_path,
+        [getattr(s, "id", "?") for s in servers],
+    )
+    return servers
+
+
+def _build_agent(
+    skill: Skill,
+    model_name: str | None = None,
+    toolsets: list[AbstractToolset[None]] | None = None,
+) -> Agent[None, str]:
+    """Build a pydantic-ai agent for a skill with built-in tools.
+
+    ``toolsets`` is the list of external MCP servers (and any other
+    pydantic-ai toolsets) the subagent should expose alongside the
+    built-in Python tools. The caller is responsible for wrapping the
+    returned agent in ``async with agent:`` so the toolsets'
+    subprocesses are started and torn down around the run.
+    """
     model = _build_model(model_name)
 
     # Load skill content as system prompt context
@@ -108,6 +170,7 @@ def _build_agent(skill: Skill, model_name: str | None = None) -> Agent[None, str
         model,
         system_prompt=system_prompt,
         tools=BUILTIN_TOOLS,  # type: ignore[arg-type]
+        toolsets=toolsets or [],
     )
 
 
@@ -273,20 +336,30 @@ async def _execute_skill_turn(
     session.last_active = datetime.now(UTC).isoformat()
     store.save(session)
 
-    agent = _build_agent(skill, model or session.model)
+    # The list of MCP toolsets is loaded once at startup and shared
+    # across runs. Each `async with agent:` enters and exits the
+    # toolsets so the underlying subprocesses are started fresh per
+    # run -- this trades a small per-turn startup cost for clean
+    # process isolation between sessions.
+    agent = _build_agent(
+        skill,
+        model or session.model,
+        toolsets=list(_mcp_toolsets),
+    )
 
     try:
-        if config.streaming:
-            output, messages = await _run_skill_streaming(
-                agent, prompt, session, store
-            )
-        else:
-            result = await agent.run(
-                prompt,
-                message_history=session.messages or None,
-            )
-            output = result.output
-            messages = result.all_messages()
+        async with agent:
+            if config.streaming:
+                output, messages = await _run_skill_streaming(
+                    agent, prompt, session, store
+                )
+            else:
+                result = await agent.run(
+                    prompt,
+                    message_history=session.messages or None,
+                )
+                output = result.output
+                messages = result.all_messages()
     except Exception as e:
         session.status = "failed"
         session.last_active = datetime.now(UTC).isoformat()
@@ -738,7 +811,7 @@ async def _check_ollama(config: ServerConfig) -> None:
 
 def _initialize() -> None:
     """Discover skills and register them as MCP tools at startup."""
-    global _skills, _config, _session_store, _inbox
+    global _skills, _config, _session_store, _inbox, _mcp_toolsets
 
     _config = ServerConfig.load()
     _session_store = SessionStore(
@@ -746,6 +819,7 @@ def _initialize() -> None:
         max_concurrent_runs=_config.max_concurrent_runs,
     )
     _inbox = Inbox(_config.inbox_dir)
+    _mcp_toolsets = _load_mcp_toolsets(_config)
 
     logger.info("Discovering skills...")
     _skills = discover_skills()

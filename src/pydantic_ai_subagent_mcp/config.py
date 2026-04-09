@@ -14,10 +14,17 @@ class ServerConfig:
     """Configuration loaded from environment and optional config file."""
 
     ollama_base_url: str = "http://localhost:11434"
-    default_model: str = "gemma4:12b"
+    default_model: str = "gemma4:26b"
     session_dir: str = ".subagent-sessions"
     inbox_dir: str = ".subagent-inbox"
     streaming: bool = True
+    # Path to a JSON file declaring external MCP servers whose tools
+    # should be exposed to every subagent run. The file uses the
+    # standard `{"mcpServers": {<name>: {command, args, env}}}` shape
+    # consumed by `pydantic_ai.mcp.load_mcp_servers`. If the file is
+    # missing the server still boots -- subagents simply have no
+    # external MCP tools, only the BUILTIN_TOOLS.
+    mcp_servers_config: str = ".subagent-mcp.servers.json"
     # Server-wide cap on the number of in-flight skill turns across
     # all sessions. The session worker acquires a slot from the
     # SessionStore's semaphore before running its turn and releases
@@ -80,6 +87,9 @@ class ServerConfig:
             streaming=streaming_default,
             max_concurrent_runs=max_concurrent,
             mailbox_max_depth=mailbox_max,
+            mcp_servers_config=data.get(
+                "mcp_servers_config", cls.mcp_servers_config
+            ),
         )
 
 

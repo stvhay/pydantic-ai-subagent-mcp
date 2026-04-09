@@ -26,6 +26,7 @@ result-*
 .issue
 .worktrees/
 .srclight/
+.subagent-mcp.servers.json
 
 # OS
 .DS_Store

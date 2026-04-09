@@ -1,6 +1,6 @@
 {
   "ollama_base_url": "http://localhost:11434",
-  "default_model": "gemma4:12b",
+  "default_model": "gemma4:26b",
   "session_dir": ".subagent-sessions",
   "streaming": true
 }

@@ -36,13 +36,35 @@ Create `.subagent-mcp.json` in your project root:
 ```json
 {
   "ollama_base_url": "http://localhost:11434",
-  "default_model": "gemma4:12b",
+  "default_model": "gemma4:26b",
   "session_dir": ".subagent-sessions",
-  "streaming": true
+  "streaming": true,
+  "mcp_servers_config": ".subagent-mcp.servers.json"
 }
 ```
 
 Environment variables `OLLAMA_BASE_URL`, `SUBAGENT_MCP_DEFAULT_MODEL`, and `SUBAGENT_MCP_STREAMING` override the config file.
+
+### External MCP servers exposed to subagents
+
+Subagents can call tools from any external MCP server you declare in `.subagent-mcp.servers.json` (the path is configurable via `mcp_servers_config`). The schema follows pydantic-ai's `load_mcp_servers` -- a top-level `mcpServers` object keyed by server name, with `command` / `args` / `env` per stdio server. Env values support `${VAR}` and `${VAR:-default}` expansion. A copy of `.subagent-mcp.servers.json.example` (with `srclight` pre-wired) ships in the repo as a starting point.
+
+```json
+{
+  "mcpServers": {
+    "srclight": {
+      "command": "uv",
+      "args": ["run", "srclight", "serve", "--transport", "stdio"],
+      "env": {
+        "PATH": "${PATH}",
+        "HOME": "${HOME}"
+      }
+    }
+  }
+}
+```
+
+Each subagent run wraps the agent in `async with agent:`, so server subprocesses are started fresh per turn and torn down on exit. A missing or malformed config file is logged and treated as empty -- the server still boots and subagents simply run with the built-in Python tools only.
 
 ## Background runs and completion notifications
 

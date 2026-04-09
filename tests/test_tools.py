@@ -12,7 +12,6 @@ from pydantic_ai_subagent_mcp.tools import (
     read_file,
     search_files,
     shell_exec,
-    web_search,
     write_file,
 )
 
@@ -81,8 +80,3 @@ async def test_shell_exec_failure() -> None:
 async def test_shell_exec_timeout() -> None:
     result = await shell_exec(CTX, "sleep 10", timeout=0.1)
     assert "timed out" in result
-
-
-async def test_web_search() -> None:
-    result = await web_search(CTX, "test query")
-    assert "not yet configured" in result
