@@ -509,6 +509,49 @@ async def test_stop_session_on_drop_swallows_exceptions(tmp_path: Path) -> None:
     assert store.has_worker(session.session_id) is False
 
 
+async def test_shutdown_timeout_on_stuck_worker(tmp_path: Path) -> None:
+    """shutdown() wrapped in wait_for raises TimeoutError when a worker
+    is stuck and does not respond to cancellation within the timeout.
+
+    This simulates the scenario from issue #27: a worker is wedged on
+    a hung Ollama call and store.shutdown() would block forever without
+    the timeout wrapper.
+    """
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create("skill", "gemma4:12b")
+    store.get_or_create_mailbox(session.session_id)
+
+    cancel_received = asyncio.Event()
+
+    async def stuck_worker() -> None:
+        """A worker that acknowledges cancellation but refuses to die."""
+        try:
+            await asyncio.Event().wait()  # block forever
+        except asyncio.CancelledError:
+            cancel_received.set()
+            # Simulate a stuck cleanup: re-block instead of exiting.
+            # This is the pathological case — the worker got the cancel
+            # signal but its cleanup path (e.g. awaiting a hung HTTP
+            # response during teardown) never returns.
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(stuck_worker())
+    store.register_worker(session.session_id, task)
+    await asyncio.sleep(0)  # let the worker reach its first await point
+
+    timeout = 0.1  # 100ms — fast for tests
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(store.shutdown(), timeout=timeout)
+
+    # The worker received the cancel signal even though it didn't exit
+    assert cancel_received.is_set()
+
+    # Clean up the stuck task so it doesn't leak into the test runner
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
 def test_session_dataclass_defaults() -> None:
     """Session can still be constructed with the minimum required fields."""
     s = Session(

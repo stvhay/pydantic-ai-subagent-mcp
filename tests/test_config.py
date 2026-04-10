@@ -107,3 +107,53 @@ def test_backpressure_file_invalid_falls_back_to_default(
     config = ServerConfig.load(config_file)
     assert config.max_concurrent_runs == 4
     assert config.mailbox_max_depth == 16
+
+
+# -- shutdown timeout knob --
+
+
+def test_shutdown_timeout_default() -> None:
+    """The default shutdown timeout is 5.0 seconds."""
+    config = ServerConfig()
+    assert config.shutdown_timeout_seconds == 5.0
+
+
+def test_shutdown_timeout_loaded_from_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SUBAGENT_MCP_SHUTDOWN_TIMEOUT", raising=False)
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({"shutdown_timeout_seconds": 10.0}))
+    config = ServerConfig.load(config_file)
+    assert config.shutdown_timeout_seconds == 10.0
+
+
+def test_shutdown_timeout_env_overrides_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({"shutdown_timeout_seconds": 10.0}))
+    monkeypatch.setenv("SUBAGENT_MCP_SHUTDOWN_TIMEOUT", "3.0")
+    config = ServerConfig.load(config_file)
+    assert config.shutdown_timeout_seconds == 3.0
+
+
+@pytest.mark.parametrize("bad_value", ["-1", "0", "inf", "not-a-number", ""])
+def test_shutdown_timeout_env_invalid_falls_back_to_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_value: str
+) -> None:
+    """Garbage env values must not crash the server -- they fall through."""
+    monkeypatch.setenv("SUBAGENT_MCP_SHUTDOWN_TIMEOUT", bad_value)
+    config = ServerConfig.load(tmp_path / "missing.json")
+    assert config.shutdown_timeout_seconds == 5.0
+
+
+def test_shutdown_timeout_file_invalid_falls_back_to_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-positive config-file values fall back to the class default."""
+    monkeypatch.delenv("SUBAGENT_MCP_SHUTDOWN_TIMEOUT", raising=False)
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({"shutdown_timeout_seconds": 0}))
+    config = ServerConfig.load(config_file)
+    assert config.shutdown_timeout_seconds == 5.0
