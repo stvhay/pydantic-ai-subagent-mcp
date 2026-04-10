@@ -337,7 +337,7 @@ async def main() -> None:
     )
     parser.add_argument(
         "--base-url",
-        default=os.environ.get("OLLAMA_BASE_URL", "https://ollama.st5ve.com"),
+        default=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
         help="Ollama base URL",
     )
     parser.add_argument(
