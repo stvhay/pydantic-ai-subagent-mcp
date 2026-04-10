@@ -125,6 +125,31 @@ Claude Code (MCP client)
 > log) in exchange for atomic per-record writes and trivial idempotency
 > via filename ordering.
 
+### ADR-7: gemma4 parallel tool_calls handling
+
+> In the context of the `run_agent` loop (`agent.py`) building multi-turn
+> tool-call history for Ollama's /api/chat, facing uncertainty about whether
+> gemma4 models emit multiple tool_calls per assistant turn and whether they
+> handle the resulting `[assistant(multi), tool, tool, ...]` history shape,
+> we verified empirically that all four available gemma4 tags (e2b, e4b,
+> 26b A4B MOE, 31b dense) both emit parallel tool_calls and continue
+> coherently after the canonical OpenAI-compat history shape. We chose to
+> keep the current implementation unchanged and lock the behavior in with
+> regression tests.
+>
+> Probe results (recorded 2026-04-10):
+> - gemma4:e2b — emission: multi, ingestion-2a: ok, ingestion-2b: ok
+> - gemma4:e4b — emission: multi, ingestion-2a: ok, ingestion-2b: ok
+> - gemma4:26b — emission: multi, ingestion-2a: ok, ingestion-2b: ok
+> - gemma4:31b — emission: multi, ingestion-2a: ok, ingestion-2b: ok
+>
+> Consequences: the `run_agent` loop is correct as-is. The behavior is
+> locked in by `tests/test_agent_parallel_tools.py` (unit) and the probe
+> script at `tests/probes/gemma4_parallel_tools.py` (opt-in live test
+> against a real endpoint). An upstream Ollama or model-template change
+> that silently alters this contract will be caught by re-running the
+> probe or by a future `@pytest.mark.live` regression test.
+
 ## Component Responsibilities
 
 | Component | Responsibility |
