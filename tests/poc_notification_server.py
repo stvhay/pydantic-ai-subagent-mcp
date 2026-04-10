@@ -87,13 +87,13 @@ async def _fire_all(
     fired.append(f"progress: {pmsg}")
 
     # 3) notifications/resources/updated
-    await session.send_resource_updated(AnyUrl("notification-test://status"))
     _status = f"updated #{n} at {ts} by {source}"
+    await session.send_resource_updated(AnyUrl("notification-test://status"))
     fired.append(f"resource_updated: {_status}")
 
     # 4) notifications/claude/channel  (bypass SDK union)
     content = f"[{ts}] claude/channel #{n} from {source}"
-    meta = {"source": "notification-test", "counter": n}
+    meta = {"source": "notification-test", "counter": str(n)}
     notification = JSONRPCNotification(
         jsonrpc="2.0",
         method="notifications/claude/channel",
