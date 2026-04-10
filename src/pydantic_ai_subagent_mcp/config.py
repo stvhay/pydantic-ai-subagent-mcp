@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -131,13 +132,13 @@ def _positive_float_env(env_var: str, file_value: Any, default: float) -> float:
     if raw is not None:
         try:
             parsed = float(raw)
-            if parsed > 0:
+            if parsed > 0 and math.isfinite(parsed):
                 return parsed
         except ValueError:
             pass
     try:
         parsed = float(file_value)
-        if parsed > 0:
+        if parsed > 0 and math.isfinite(parsed):
             return parsed
     except (TypeError, ValueError):
         pass

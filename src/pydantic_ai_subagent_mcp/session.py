@@ -264,11 +264,13 @@ class SessionStore:
         workers = list(self._workers.items())
         for _, w in workers:
             w.cancel()
-        if workers:
-            tasks = [w for _, w in workers]
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._workers.clear()
-        self._mailboxes.clear()
+        try:
+            if workers:
+                tasks = [w for _, w in workers]
+                await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            self._workers.clear()
+            self._mailboxes.clear()
 
     async def stop_session(
         self,

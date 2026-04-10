@@ -138,7 +138,7 @@ def test_shutdown_timeout_env_overrides_file(
     assert config.shutdown_timeout_seconds == 3.0
 
 
-@pytest.mark.parametrize("bad_value", ["-1", "0", "not-a-number", ""])
+@pytest.mark.parametrize("bad_value", ["-1", "0", "inf", "not-a-number", ""])
 def test_shutdown_timeout_env_invalid_falls_back_to_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_value: str
 ) -> None:
