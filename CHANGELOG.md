@@ -2,7 +2,11 @@
 
 ## Unreleased
 
-<!-- bump: minor -->
+<!-- bump: patch -->
+
+### Changed
+
+- Documentation rewrite: README, ARCHITECTURE, DESIGN, and CLAUDE.md updated to reflect the post-#25 native /api/chat architecture. ADR-1/2/3 rewritten in place with "Supersedes" notes; ADR-4/5/6/7 preserved verbatim. Component table expanded with `agent.py`, `ollama.py`, `mcp_loader.py`. All stale pydantic-ai references removed (#29).
 
 ### Added
 
