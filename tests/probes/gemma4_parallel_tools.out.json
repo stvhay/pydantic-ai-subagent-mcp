@@ -1,0 +1,154 @@
+[
+  {
+    "model": "gemma4:e2b",
+    "error": null,
+    "emission": "multi",
+    "turn1_tool_calls": [
+      {
+        "id": "call_a6xfvrcf",
+        "function": {
+          "index": 0,
+          "name": "get_time",
+          "arguments": {
+            "tz": "Asia/Tokyo"
+          }
+        }
+      },
+      {
+        "id": "call_1ds52vjb",
+        "function": {
+          "index": 0,
+          "name": "get_weather",
+          "arguments": {
+            "city": "Paris"
+          }
+        }
+      }
+    ],
+    "turn1_content": "",
+    "turn1_done_reason": "stop",
+    "turn1_elapsed_s": 4.66,
+    "ingestion_2a": "ok",
+    "turn2a_content": "The time in Asia/Tokyo is 14:32 JST, and the weather in Paris is 72\u00b0F and sunny.",
+    "turn2a_elapsed_s": 1.63,
+    "turn2a_extra_tool_calls": 0,
+    "ingestion_2b": "ok",
+    "turn2b_content": "The current time in Asia/Tokyo is 14:32 JST, and the weather in Paris is 72\u00b0F and sunny.",
+    "turn2b_elapsed_s": 1.53,
+    "turn2b_extra_tool_calls": 0
+  },
+  {
+    "model": "gemma4:e4b",
+    "error": null,
+    "emission": "multi",
+    "turn1_tool_calls": [
+      {
+        "id": "call_fuzlljn7",
+        "function": {
+          "index": 0,
+          "name": "get_time",
+          "arguments": {
+            "tz": "Asia/Tokyo"
+          }
+        }
+      },
+      {
+        "id": "call_gin2nbpz",
+        "function": {
+          "index": 0,
+          "name": "get_weather",
+          "arguments": {
+            "city": "Paris"
+          }
+        }
+      }
+    ],
+    "turn1_content": "",
+    "turn1_done_reason": "stop",
+    "turn1_elapsed_s": 5.17,
+    "ingestion_2a": "ok",
+    "turn2a_content": "The time in Asia/Tokyo is 14:32 JST, and the weather in Paris is 72\u00b0F and sunny.",
+    "turn2a_elapsed_s": 0.44,
+    "turn2a_extra_tool_calls": 0,
+    "ingestion_2b": "ok",
+    "turn2b_content": "The time in Asia/Tokyo is 14:32 JST, and the weather in Paris is 72\u00b0F and sunny.",
+    "turn2b_elapsed_s": 0.45,
+    "turn2b_extra_tool_calls": 0
+  },
+  {
+    "model": "gemma4:26b",
+    "error": null,
+    "emission": "multi",
+    "turn1_tool_calls": [
+      {
+        "id": "call_738hr6t4",
+        "function": {
+          "index": 0,
+          "name": "get_time",
+          "arguments": {
+            "tz": "Asia/Tokyo"
+          }
+        }
+      },
+      {
+        "id": "call_hdxf2ngv",
+        "function": {
+          "index": 0,
+          "name": "get_weather",
+          "arguments": {
+            "city": "Paris"
+          }
+        }
+      }
+    ],
+    "turn1_content": "",
+    "turn1_done_reason": "stop",
+    "turn1_elapsed_s": 11.08,
+    "ingestion_2a": "ok",
+    "turn2a_content": "It is currently 14:32 JST in Tokyo, and the weather in Paris is 72\u00b0F and sunny.",
+    "turn2a_elapsed_s": 2.06,
+    "turn2a_extra_tool_calls": 0,
+    "ingestion_2b": "ok",
+    "turn2b_content": "The current time in Tokyo is 2:32 PM JST, and the weather in Paris is 72\u00b0F and sunny.",
+    "turn2b_elapsed_s": 2.06,
+    "turn2b_extra_tool_calls": 0
+  },
+  {
+    "model": "gemma4:31b",
+    "error": null,
+    "emission": "multi",
+    "turn1_tool_calls": [
+      {
+        "id": "call_oa1mrzxc",
+        "function": {
+          "index": 0,
+          "name": "get_time",
+          "arguments": {
+            "tz": "Asia/Tokyo"
+          }
+        }
+      },
+      {
+        "id": "call_hiif0r28",
+        "function": {
+          "index": 0,
+          "name": "get_weather",
+          "arguments": {
+            "city": "Paris"
+          }
+        }
+      }
+    ],
+    "turn1_content": "",
+    "turn1_done_reason": "stop",
+    "turn1_elapsed_s": 37.22,
+    "ingestion_2a": "ok",
+    "turn2a_content": "It is currently 14:32 in Tokyo, and the weather in Paris is 72\u00b0F and sunny.",
+    "turn2a_elapsed_s": 9.31,
+    "turn2a_extra_tool_calls": 0,
+    "ingestion_2b": "ok",
+    "turn2b_content": "The current time in Tokyo is 2:32 PM JST, and the weather in Paris is 72\u00b0F and sunny.",
+    "turn2b_elapsed_s": 9.85,
+    "turn2b_extra_tool_calls": 0
+  }
+]
