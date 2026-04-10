@@ -67,8 +67,19 @@ async def _lifespan(_app: FastMCP[None]) -> AsyncIterator[None]:
         yield
     finally:
         store = _get_session_store()
-        with suppress(Exception):
-            await store.shutdown()
+        try:
+            await asyncio.wait_for(
+                store.shutdown(),
+                timeout=config.shutdown_timeout_seconds,
+            )
+        except TimeoutError:
+            logger.warning(
+                "SessionStore.shutdown() timed out after %.1fs; "
+                "proceeding with resource teardown",
+                config.shutdown_timeout_seconds,
+            )
+        except Exception:
+            logger.exception("SessionStore.shutdown() raised unexpectedly")
         if _mcp_loader is not None:
             with suppress(Exception):
                 await _mcp_loader.aclose()
