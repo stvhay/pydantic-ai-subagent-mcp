@@ -4,7 +4,7 @@
 
 pydantic-ai-subagent-mcp is an MCP server that bridges Claude Code skills to local
 Ollama models. It sits between Claude Code (MCP client) and Ollama (LLM backend),
-using pydantic-ai as the agent framework.
+using a native multi-turn agent loop over Ollama's /api/chat endpoint.
 
 ## System Context
 
@@ -13,10 +13,15 @@ Claude Code (MCP client)
   |
   +-- stdio --> subagent-mcp (FastMCP server)
   |               |
-  |               +-- pydantic-ai Agent
-  |               |    +-- OpenAIChatModel + OllamaProvider --> Ollama
-  |               |    +-- Built-in tools (file I/O, search, shell)
-  |               |    +-- MCPServerStdio toolsets --> srclight, self (recursive)
+  |               +-- run_agent loop (agent.py)
+  |               |    +-- OllamaClient.chat_turn --> Ollama /api/chat
+  |               |    +-- Tool[] (unified dispatch)
+  |               |         +-- Built-in tools (file I/O, search, shell)
+  |               |         +-- MCP-proxied tools (thin shims via MCPToolLoader)
+  |               |
+  |               +-- MCPToolLoader (mcp_loader.py)
+  |               |    +-- Long-lived MCP child sessions (AsyncExitStack)
+  |               |    \-- srclight, self (recursive), user-declared servers
   |               |
   |               +-- SessionStore (JSON on disk, UUID-keyed)
   |               |    +-- per-session mailbox (asyncio.Queue) + worker task
@@ -31,32 +36,56 @@ Claude Code (MCP client)
   |                     |
   +-- UserPromptSubmit hook --> notification_hook.py (push mode, cursor-tracked)
   |
-  +-- srclight (optional, code indexing MCP server)
+  +-- srclight (optional, code indexing MCP server -- loaded via MCPToolLoader)
 ```
 
 ## Key Architectural Decisions
 
-### ADR-1: pydantic-ai as agent framework
+### ADR-1: Native /api/chat loop over pydantic-ai
 
-> In the context of needing an agent framework for Ollama, facing choices between
-> raw API calls, LangChain, and pydantic-ai, we chose pydantic-ai to get native
-> Ollama support, typed tool definitions, and built-in MCP client capabilities,
-> accepting coupling to the pydantic-ai API surface.
+> *Supersedes the original ADR-1 ("pydantic-ai as agent framework") as of #25.*
+>
+> In the context of running multi-turn tool-using conversations against Ollama,
+> facing a choice between keeping pydantic-ai or owning the loop directly, we
+> replaced pydantic-ai with a hand-rolled multi-turn loop (`run_agent` in
+> `agent.py`) driving `OllamaClient.chat_turn` (ollama.py). Two bugs motivated
+> the switch: (1) pydantic-ai's `ModelMessage` types did not round-trip cleanly
+> to Ollama's /api/chat wire shape, requiring fragile translation on every turn;
+> (2) the OpenAI-compat shim at /v1 (which pydantic-ai used) strips
+> Ollama-specific options like `num_ctx`, making it impossible to raise the
+> default 4096 context window. We accept owning the multi-turn loop, tool
+> dispatch, and streaming accumulation ourselves, with no framework-provided
+> retry or backoff.
 
-### ADR-2: Native message history over text concatenation
+### ADR-2: Ollama-native message history
 
-> In the context of multi-turn sessions, facing a choice between manually
-> concatenating prior messages as text or using pydantic-ai's `message_history`
-> parameter, we chose native message history to preserve tool call/result structure
-> and let the framework manage context, accepting that session serialization must
-> use `ModelMessagesTypeAdapter`.
+> *Supersedes the original ADR-2 ("Native message history over text
+> concatenation") as of #25.*
+>
+> In the context of persisting multi-turn sessions, facing a choice between a
+> typed message model with a serialization adapter or storing Ollama's wire
+> shape directly, we chose plain `list[dict[str, Any]]` -- the exact shape
+> Ollama's /api/chat expects and returns. Session persistence is
+> `json.dumps`/`json.loads` with no translation layer. Resuming a session
+> appends to the list and re-calls `run_agent`. We accept that there is no
+> typed validation on deserialization; the wire format is the contract.
 
-### ADR-3: MCP client for external tool access
+### ADR-3: Unified Tool dataclass for built-in and MCP tools
 
-> In the context of giving subagents access to srclight and recursive sub-agents,
-> facing a choice between custom HTTP integrations or pydantic-ai's MCP client,
-> we chose `MCPServerStdio` toolsets to reuse the MCP protocol and enable the agent
-> to call any MCP server, accepting subprocess management overhead.
+> *Supersedes the original ADR-3 ("MCP client for external tool access") as
+> of #25.*
+>
+> In the context of giving the agent loop a uniform tool interface, facing a
+> choice between separate dispatch paths for Python tools and MCP tools, we
+> chose a single `Tool` dataclass (`agent.py`) with `name`, `description`,
+> `parameters` (JSON Schema), and `fn` (async callable). Built-in Python
+> tools construct `Tool` directly; external MCP servers are spawned once at
+> startup by `MCPToolLoader` (`mcp_loader.py`), which wraps each remote tool
+> as a `Tool` with a thin shim that forwards to the long-lived
+> `ClientSession`. The agent loop dispatches all tools through the same
+> callable interface and never knows the difference. We accept that external
+> MCP child processes are held open for the server's entire lifetime rather
+> than started per-run.
 
 ### ADR-4: Log-based streaming over MCP progress notifications
 
@@ -154,10 +183,13 @@ Claude Code (MCP client)
 
 | Component | Responsibility |
 |-----------|---------------|
-| `server.py` | FastMCP server, tool registration, agent orchestration; per-session worker tasks; backpressure (run semaphore + mailbox cap); `stop_session` |
+| `server.py` | FastMCP server, tool registration, `_run_skill_streaming` orchestration; per-session worker tasks; backpressure (run semaphore + mailbox cap); `stop_session` |
+| `agent.py` | Multi-turn agent loop (`run_agent`), `Tool` dataclass (unified built-in + MCP dispatch), `AgentResult` |
+| `ollama.py` | Native Ollama /api/chat client (`OllamaClient`), NDJSON streaming (`chat_stream`), `ChatClient` Protocol, `TurnResult`, `StreamChunk` |
+| `mcp_loader.py` | External MCP server lifecycle (`MCPToolLoader`): spawns child processes at startup via `AsyncExitStack`, wraps remote tools as `Tool` shims |
 | `config.py` | Configuration from file + environment |
 | `skills.py` | Skill discovery from filesystem |
-| `session.py` | Session persistence with native pydantic-ai messages; per-session `.log` files for streaming output; per-session mailboxes, worker registry, server-wide run semaphore, and `stop_session` drain |
+| `session.py` | Session persistence with Ollama-native messages (`list[dict]`); per-session `.log` files for streaming output; per-session mailboxes, worker registry, server-wide run semaphore, and `stop_session` drain |
 | `inbox.py` | Durable on-disk outbox of completion notifications (uuid7-named JSON files, atomic per-record writes, cursor-based forward drain) |
 | `tools.py` | Built-in tools for file I/O, search, shell |
 | `scripts/notification_hook.py` | Standalone Claude Code `UserPromptSubmit` hook bridge that drains the inbox into prompt context (does not import the package) |
