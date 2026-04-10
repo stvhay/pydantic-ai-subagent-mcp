@@ -39,6 +39,11 @@ class ServerConfig:
     # bound, and a foreground caller cannot bypass the cap by
     # omitting run_in_background.
     mailbox_max_depth: int = 16
+    # Timeout in seconds for SessionStore.shutdown() during server
+    # teardown. If workers do not drain within this window, teardown
+    # proceeds anyway — closing the Ollama HTTP client and MCP children
+    # destroys the transports stuck workers depend on.
+    shutdown_timeout_seconds: float = 5.0
 
     @classmethod
     def load(cls, config_path: Path | None = None) -> ServerConfig:
@@ -64,6 +69,11 @@ class ServerConfig:
             data.get("mailbox_max_depth", cls.mailbox_max_depth),
             cls.mailbox_max_depth,
         )
+        shutdown_timeout = _positive_float_env(
+            "SUBAGENT_MCP_SHUTDOWN_TIMEOUT",
+            data.get("shutdown_timeout_seconds", cls.shutdown_timeout_seconds),
+            cls.shutdown_timeout_seconds,
+        )
 
         # Environment overrides take precedence
         return cls(
@@ -78,6 +88,7 @@ class ServerConfig:
             inbox_dir=data.get("inbox_dir", cls.inbox_dir),
             max_concurrent_runs=max_concurrent,
             mailbox_max_depth=mailbox_max,
+            shutdown_timeout_seconds=shutdown_timeout,
             mcp_servers_config=data.get(
                 "mcp_servers_config", cls.mcp_servers_config
             ),
@@ -103,6 +114,29 @@ def _positive_int_env(env_var: str, file_value: Any, default: int) -> int:
             pass
     try:
         parsed = int(file_value)
+        if parsed > 0:
+            return parsed
+    except (TypeError, ValueError):
+        pass
+    return default
+
+
+def _positive_float_env(env_var: str, file_value: Any, default: float) -> float:
+    """Resolve a positive-float knob from env / config file / default.
+
+    Same precedence and fallback rules as ``_positive_int_env`` but for
+    float-valued knobs (e.g. timeouts in seconds).
+    """
+    raw = os.environ.get(env_var)
+    if raw is not None:
+        try:
+            parsed = float(raw)
+            if parsed > 0:
+                return parsed
+        except ValueError:
+            pass
+    try:
+        parsed = float(file_value)
         if parsed > 0:
             return parsed
     except (TypeError, ValueError):
