@@ -30,7 +30,8 @@ import time
 import traceback
 from typing import Any
 
-# Ensure the project src is importable when running from the repo root.
+# Ensure the project src is importable when running directly as
+# `python tests/probes/gemma4_parallel_tools.py` (without `uv run`).
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from pydantic_ai_subagent_mcp.ollama import OllamaClient  # noqa: E402
