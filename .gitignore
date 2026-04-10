@@ -27,6 +27,11 @@ result-*
 .worktrees/
 .srclight/
 .subagent-mcp.servers.json
+.subagent-inbox/
+.subagent-sessions/
+
+# direnv
+.direnv/
 
 # OS
 .DS_Store
