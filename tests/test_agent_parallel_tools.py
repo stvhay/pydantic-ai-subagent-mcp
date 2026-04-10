@@ -91,7 +91,7 @@ async def test_single_tool_call_turn_history_shape() -> None:
         _turn(content="done"),
     ])
     result: AgentResult = await run_agent(
-        client=client,  # type: ignore[arg-type]
+        client=client,
         model="test-model",
         system="You are a test agent.",
         user="hello",
@@ -112,7 +112,7 @@ async def test_multi_tool_call_turn_history_shape() -> None:
         _turn(content="done"),
     ])
     result = await run_agent(
-        client=client,  # type: ignore[arg-type]
+        client=client,
         model="test-model",
         system="sys",
         user="go",
@@ -142,7 +142,7 @@ async def test_tool_result_field_name() -> None:
         _turn(content="done"),
     ])
     result = await run_agent(
-        client=client,  # type: ignore[arg-type]
+        client=client,
         model="test-model",
         system="sys",
         user="go",
@@ -160,7 +160,7 @@ async def test_three_parallel_tool_calls() -> None:
         _turn(content="final"),
     ])
     result = await run_agent(
-        client=client,  # type: ignore[arg-type]
+        client=client,
         model="test-model",
         system="sys",
         user="go",
@@ -185,7 +185,7 @@ async def test_multi_tool_call_with_unknown_tool() -> None:
         _turn(content="recovered"),
     ])
     result = await run_agent(
-        client=client,  # type: ignore[arg-type]
+        client=client,
         model="test-model",
         system="sys",
         user="go",

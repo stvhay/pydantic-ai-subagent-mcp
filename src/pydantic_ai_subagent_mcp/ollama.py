@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
@@ -92,6 +92,28 @@ class TurnResult:
         if self.thinking:
             msg["thinking"] = self.thinking
         return msg
+
+
+@runtime_checkable
+class ChatClient(Protocol):
+    """Structural interface for anything that can drive one chat turn.
+
+    ``run_agent`` depends on this Protocol rather than the concrete
+    ``OllamaClient``, so tests can supply a fake without ``type: ignore``.
+    """
+
+    async def chat_turn(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        num_ctx: int = DEFAULT_NUM_CTX,
+        temperature: float = GEMMA4_TEMPERATURE,
+        top_p: float = GEMMA4_TOP_P,
+        top_k: int = GEMMA4_TOP_K,
+        on_content_delta: ContentDeltaCallback | None = None,
+    ) -> TurnResult: ...
 
 
 class OllamaClient:

@@ -32,8 +32,8 @@ from .ollama import (
     GEMMA4_TEMPERATURE,
     GEMMA4_TOP_K,
     GEMMA4_TOP_P,
+    ChatClient,
     ContentDeltaCallback,
-    OllamaClient,
 )
 
 logger = logging.getLogger("subagent-mcp.agent")
@@ -143,7 +143,7 @@ async def _dispatch_tool(
 
 async def run_agent(
     *,
-    client: OllamaClient,
+    client: ChatClient,
     model: str,
     system: str,
     user: str | None = None,
