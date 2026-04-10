@@ -15,42 +15,68 @@ from typing import Any, TextIO
 
 import httpx
 from mcp.server.fastmcp import FastMCP
-from pydantic_ai import Agent
-from pydantic_ai.mcp import (
-    MCPServerSSE,
-    MCPServerStdio,
-    MCPServerStreamableHTTP,
-    load_mcp_servers,
-)
-from pydantic_ai.messages import ModelMessage
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.ollama import OllamaProvider
-from pydantic_ai.toolsets import AbstractToolset
 
+from .agent import Tool, run_agent
 from .config import ServerConfig
 from .inbox import Inbox
+from .mcp_loader import MCPToolLoader
+from .ollama import OllamaClient
 from .session import Session, SessionStore
 from .skills import Skill, discover_skills
 from .tools import BUILTIN_TOOLS
 
 logger = logging.getLogger("subagent-mcp")
 
-# Type alias for the union returned by pydantic-ai's load_mcp_servers
-_MCPServer = MCPServerStdio | MCPServerStreamableHTTP | MCPServerSSE
-
 # Global state initialized at startup
 _config: ServerConfig | None = None
 _session_store: SessionStore | None = None
 _inbox: Inbox | None = None
 _skills: list[Skill] = []
-_mcp_toolsets: list[_MCPServer] = []
+_mcp_loader: MCPToolLoader | None = None
+_ollama_client: OllamaClient | None = None
 
 
 @asynccontextmanager
 async def _lifespan(_app: FastMCP[None]) -> AsyncIterator[None]:
-    """Run async startup tasks before the server begins accepting requests."""
-    await _check_ollama(_get_config())
-    yield
+    """Run async startup + teardown around the server's request loop.
+
+    On startup: probe Ollama, build the shared HTTP client, and spawn
+    every external MCP child process declared in the servers config.
+    External tools are held open for the lifetime of the parent server
+    so subagent runs do not pay subprocess startup cost per turn.
+
+    On shutdown: drain in-flight session workers, close the loader's
+    long-lived MCP children in LIFO order, then close the shared
+    Ollama HTTP client. Order matters: workers depend on the loader's
+    tools, the loader depends on the HTTP transports, and tearing the
+    HTTP client down before its consumers would race.
+    """
+    global _mcp_loader, _ollama_client
+    config = _get_config()
+    await _check_ollama(config)
+
+    # Shared httpx client so connection pooling carries across runs.
+    _ollama_client = OllamaClient(base_url=config.ollama_base_url)
+
+    # Spawn external MCP servers once. Long-lived sessions are safe to
+    # call from any task -- verified empirically against the SDK.
+    _mcp_loader = MCPToolLoader()
+    await _mcp_loader.load(Path(config.mcp_servers_config))
+
+    try:
+        yield
+    finally:
+        store = _get_session_store()
+        with suppress(Exception):
+            await store.shutdown()
+        if _mcp_loader is not None:
+            with suppress(Exception):
+                await _mcp_loader.aclose()
+            _mcp_loader = None
+        if _ollama_client is not None:
+            with suppress(Exception):
+                await _ollama_client.aclose()
+            _ollama_client = None
 
 
 mcp_server = FastMCP(
@@ -89,89 +115,40 @@ def _get_inbox() -> Inbox:
     return _inbox
 
 
-def _build_model(model_name: str | None = None) -> OpenAIChatModel:
-    """Build a pydantic-ai model pointing at the Ollama endpoint."""
-    config = _get_config()
-    name = model_name or config.default_model
-    return OpenAIChatModel(
-        model_name=name,
-        provider=OllamaProvider(base_url=f"{config.ollama_base_url}/v1"),
-    )
+def _build_system_prompt(skill: Skill) -> str:
+    """Render the system prompt for one skill run.
 
-
-def _load_mcp_toolsets(config: ServerConfig) -> list[_MCPServer]:
-    """Load external MCP servers declared in ``config.mcp_servers_config``.
-
-    Returns an empty list when the file is missing -- subagents still
-    boot, they simply have no external MCP tools beyond ``BUILTIN_TOOLS``.
-    A malformed config file is logged and treated as empty so a typo in
-    the JSON cannot prevent the server from starting.
-
-    Each returned server is a long-lived ``MCPServer`` instance whose
-    subprocess (or HTTP client) lifetime is managed by the agent's
-    async context manager: callers must wrap agent runs in
-    ``async with agent:`` so the toolset is entered/exited around the
-    actual run.
+    The full SKILL.md content is inlined as the model's instructions
+    so the skill author's voice carries through verbatim. The trailing
+    paragraph nudges the model toward the tool surface without
+    enumerating every tool -- the tool list itself is shipped
+    alongside the prompt as Ollama's ``tools[]`` array, which the
+    model picks up natively.
     """
-    config_path = Path(config.mcp_servers_config)
-    if not config_path.exists():
-        logger.info(
-            "No MCP servers config at %s; subagents will run with built-in tools only",
-            config_path,
-        )
-        return []
-    try:
-        servers = load_mcp_servers(config_path)
-    except Exception:
-        logger.exception(
-            "Failed to load MCP servers config from %s; "
-            "subagents will run with built-in tools only",
-            config_path,
-        )
-        return []
-    logger.info(
-        "Loaded %d MCP server(s) from %s: %s",
-        len(servers),
-        config_path,
-        [getattr(s, "id", "?") for s in servers],
-    )
-    return servers
-
-
-def _build_agent(
-    skill: Skill,
-    model_name: str | None = None,
-    toolsets: list[AbstractToolset[None]] | None = None,
-) -> Agent[None, str]:
-    """Build a pydantic-ai agent for a skill with built-in tools.
-
-    ``toolsets`` is the list of external MCP servers (and any other
-    pydantic-ai toolsets) the subagent should expose alongside the
-    built-in Python tools. The caller is responsible for wrapping the
-    returned agent in ``async with agent:`` so the toolsets'
-    subprocesses are started and torn down around the run.
-    """
-    model = _build_model(model_name)
-
-    # Load skill content as system prompt context
     skill_content = ""
     if skill.source_path.exists():
         skill_content = skill.source_path.read_text()
-
-    system_prompt = (
+    return (
         f"You are executing the skill '{skill.name}'.\n\n"
         f"Skill definition:\n{skill_content}\n\n"
-        "You have access to tools for reading/writing files, searching code, "
-        "running shell commands, and more. Use them to accomplish the task.\n"
-        "Be thorough but concise in your responses."
+        "You have access to tools for reading/writing files, searching "
+        "code, running shell commands, and (when configured) external "
+        "MCP servers. Use them to gather evidence before making claims. "
+        "Be thorough but concise."
     )
 
-    return Agent(
-        model,
-        system_prompt=system_prompt,
-        tools=BUILTIN_TOOLS,  # type: ignore[arg-type]
-        toolsets=toolsets or [],
-    )
+
+def _all_tools() -> list[Tool]:
+    """Return the merged tool list visible to a subagent run.
+
+    Built-in Python tools come first, MCP-loaded tools follow. The
+    order is what the model sees in its prompt; built-ins are placed
+    first so the most-used reach-for tools (``read_file``, etc.) are
+    cheap to attend to.
+    """
+    if _mcp_loader is None:
+        return list(BUILTIN_TOOLS)
+    return list(BUILTIN_TOOLS) + _mcp_loader.tools
 
 
 def _write_trailer(
@@ -207,49 +184,71 @@ def _write_trailer(
 
 
 async def _run_skill_streaming(
-    agent: Agent[None, str],
+    skill: Skill,
     prompt: str,
     session: Session,
     store: SessionStore,
-) -> tuple[str, list[ModelMessage]]:
-    """Run the agent with streaming and write deltas to the session log.
+    model_name: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Run the agent loop with streaming and write deltas to the session log.
 
     Opens ``{session_dir}/{session_id}.log`` in append mode, writes a
     timestamped ``--- prompt ---`` / ``--- response ---`` header block,
-    then streams text deltas from ``agent.run_stream()`` to the file with
-    per-chunk flush so concurrent tail readers see output in real time.
+    then drives ``run_agent`` with an ``on_content_delta`` callback that
+    flushes each text chunk to the log so concurrent tail readers see
+    output in real time. The agent loop itself owns the multi-turn
+    sequencing and tool dispatch; this function just plumbs streaming
+    output and the trailer/cancellation envelope around it.
 
-    Each turn is terminated by a trailer line so tail clients can detect
-    completion: ``--- end ok {iso_ts} ---`` on success,
-    ``--- end error {iso_ts}: {ExceptionType}: {message} ---`` on failure
-    (any ``Exception`` escaping ``run_stream``/``stream_text``), or
-    ``--- end cancelled {iso_ts}: {ExceptionType}: {message} ---`` on
-    cancellation (``CancelledError`` from a client disconnect, or any
-    other ``BaseException`` like ``KeyboardInterrupt``/``SystemExit``).
-    Trailer writes are best-effort and never mask the original exception:
-    if the trailer write itself fails, the failure is logged but the
-    caller's exception is what propagates.
+    Each turn block is terminated by a trailer line so tail clients can
+    detect completion: ``--- end ok ---`` on success,
+    ``--- end error: ... ---`` on failure, or ``--- end cancelled: ... ---``
+    on client disconnect / interpreter teardown. Trailer writes are
+    best-effort and never mask the original exception.
 
-    Returns ``(final_output, all_messages)``.
+    Returns ``(final_output, all_messages)`` where messages is the full
+    history in Ollama-native shape, ready to be persisted to the
+    session JSON or fed back into a follow-up resume.
     """
+    if _ollama_client is None:
+        msg = "Ollama client not initialized; lifespan did not run"
+        raise RuntimeError(msg)
+
     log_path = store.log_path(session.session_id)
     header = (
         f"\n--- {datetime.now(UTC).isoformat()} prompt ---\n"
         f"{prompt}\n--- response ---\n"
     )
+
+    # Resume vs fresh: if the session already has messages, the system
+    # prompt was set on the first turn -- we feed the existing history
+    # plus the new user message into the loop. Otherwise we build a
+    # fresh system+user pair.
+    if session.messages:
+        loop_messages: list[dict[str, Any]] | None = list(session.messages)
+        loop_user: str | None = prompt
+    else:
+        loop_messages = None
+        loop_user = prompt
+
     with log_path.open("a", encoding="utf-8") as log:
         log.write(header)
         log.flush()
+
+        async def on_delta(chunk: str) -> None:
+            log.write(chunk)
+            log.flush()
+
         try:
-            async with agent.run_stream(
-                prompt,
-                message_history=session.messages or None,
-            ) as result:
-                async for chunk in result.stream_text(delta=True):
-                    log.write(chunk)
-                    log.flush()
-                output = await result.get_output()
-                messages = result.all_messages()
+            result = await run_agent(
+                client=_ollama_client,
+                model=model_name,
+                system=_build_system_prompt(skill),
+                user=loop_user,
+                messages=loop_messages,
+                tools=_all_tools(),
+                on_content_delta=on_delta,
+            )
         except Exception as e:
             _write_trailer(log, "error", e)
             raise
@@ -267,7 +266,7 @@ async def _run_skill_streaming(
             raise
         else:
             _write_trailer(log, "ok", None)
-    return output, messages
+    return result.output, result.messages
 
 
 def _emit_notification(
@@ -330,36 +329,17 @@ async def _execute_skill_turn(
     best-effort basis.
     """
     store = _get_session_store()
-    config = _get_config()
 
     session.status = "running"
     session.last_active = datetime.now(UTC).isoformat()
     store.save(session)
 
-    # The list of MCP toolsets is loaded once at startup and shared
-    # across runs. Each `async with agent:` enters and exits the
-    # toolsets so the underlying subprocesses are started fresh per
-    # run -- this trades a small per-turn startup cost for clean
-    # process isolation between sessions.
-    agent = _build_agent(
-        skill,
-        model or session.model,
-        toolsets=list(_mcp_toolsets),
-    )
+    effective_model = model or session.model
 
     try:
-        async with agent:
-            if config.streaming:
-                output, messages = await _run_skill_streaming(
-                    agent, prompt, session, store
-                )
-            else:
-                result = await agent.run(
-                    prompt,
-                    message_history=session.messages or None,
-                )
-                output = result.output
-                messages = result.all_messages()
+        output, messages = await _run_skill_streaming(
+            skill, prompt, session, store, effective_model
+        )
     except Exception as e:
         session.status = "failed"
         session.last_active = datetime.now(UTC).isoformat()
@@ -685,7 +665,7 @@ async def list_available_skills() -> str:
         "Pass offset=0 for the first call, then feed back the returned "
         "next_offset to poll for new content. Returns JSON with "
         "session_id, text (raw stream output), and next_offset. For the "
-        "structured pydantic-ai message history of completed turns, use "
+        "structured message history of completed turns, use "
         "get_session_transcript."
     ),
 )
@@ -810,8 +790,15 @@ async def _check_ollama(config: ServerConfig) -> None:
 
 
 def _initialize() -> None:
-    """Discover skills and register them as MCP tools at startup."""
-    global _skills, _config, _session_store, _inbox, _mcp_toolsets
+    """Discover skills and register them as MCP tools at startup.
+
+    External MCP servers and the Ollama HTTP client are *not* started
+    here -- they live in the lifespan async context manager so they
+    can run on the event loop. ``_initialize`` only does the
+    synchronous setup that has to happen before FastMCP's tool
+    registration: config, store, inbox, and skill discovery.
+    """
+    global _skills, _config, _session_store, _inbox
 
     _config = ServerConfig.load()
     _session_store = SessionStore(
@@ -819,7 +806,6 @@ def _initialize() -> None:
         max_concurrent_runs=_config.max_concurrent_runs,
     )
     _inbox = Inbox(_config.inbox_dir)
-    _mcp_toolsets = _load_mcp_toolsets(_config)
 
     logger.info("Discovering skills...")
     _skills = discover_skills()

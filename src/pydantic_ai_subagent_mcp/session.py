@@ -1,4 +1,4 @@
-"""Session management with UUID-keyed transcripts using native pydantic-ai messages."""
+"""Session management with UUID-keyed transcripts in Ollama-native message shape."""
 
 from __future__ import annotations
 
@@ -15,8 +15,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
-
 logger = logging.getLogger("subagent-mcp.session")
 
 # Lifecycle states for an individual session.
@@ -30,20 +28,26 @@ SessionStatus = Literal["idle", "running", "failed"]
 
 @dataclass
 class Session:
-    """A session with UUID key and native pydantic-ai message history."""
+    """A session with UUID key and Ollama-native message history.
+
+    ``messages`` is a list of plain dicts in /api/chat shape:
+    ``{"role": "system|user|assistant|tool", "content": str, ...}``.
+    Assistant turns may carry ``tool_calls`` and ``thinking``; tool
+    turns carry ``tool_name``. Storing the wire shape directly means
+    persistence is plain ``json.dumps``/``json.loads`` and resuming a
+    session is appending to the list and re-running the agent loop --
+    no serialize/deserialize translation tax.
+    """
 
     session_id: str
     skill_name: str
     model: str
     created_at: str
-    messages: list[ModelMessage] = field(default_factory=list)
+    messages: list[dict[str, Any]] = field(default_factory=list)
     status: SessionStatus = "idle"
     last_active: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        messages_json = json.loads(
-            ModelMessagesTypeAdapter.dump_json(self.messages)
-        )
         return {
             "session_id": self.session_id,
             "skill_name": self.skill_name,
@@ -51,7 +55,7 @@ class Session:
             "created_at": self.created_at,
             "status": self.status,
             "last_active": self.last_active or self.created_at,
-            "messages": messages_json,
+            "messages": self.messages,
         }
 
 
@@ -134,9 +138,10 @@ class SessionStore:
         if not path.exists():
             return None
         data = json.loads(path.read_text())
-        messages = ModelMessagesTypeAdapter.validate_python(
-            data.get("messages", [])
-        )
+        # Messages are stored in Ollama-native shape (list of dicts);
+        # no validation layer needed because the agent loop and the
+        # wire format are already the same shape.
+        messages = list(data.get("messages") or [])
         # status/last_active may be absent in pre-Phase-2 session files;
         # default to idle and the creation timestamp so old sessions load.
         status: SessionStatus = data.get("status", "idle")

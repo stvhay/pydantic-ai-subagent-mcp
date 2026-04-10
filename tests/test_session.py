@@ -1,4 +1,4 @@
-"""Tests for session management with native pydantic-ai messages."""
+"""Tests for session management with Ollama-native (dict) messages."""
 
 import asyncio
 import json
@@ -7,23 +7,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic_ai.messages import (
-    ModelMessage,
-    ModelMessagesTypeAdapter,
-    ModelRequest,
-    ModelResponse,
-    TextPart,
-    UserPromptPart,
-)
 
 from pydantic_ai_subagent_mcp.session import Session, SessionStore
 
 
-def _make_messages() -> list[ModelMessage]:
-    """Create a simple request/response pair for testing."""
+def _make_messages() -> list[dict[str, Any]]:
+    """Create a simple user/assistant pair in Ollama-native shape."""
     return [
-        ModelRequest(parts=[UserPromptPart(content="hello")]),
-        ModelResponse(parts=[TextPart(content="hi there")]),
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi there"},
     ]
 
 
@@ -52,13 +44,12 @@ def test_session_persistence_with_native_messages(tmp_path: Path) -> None:
     assert loaded is not None
     assert len(loaded.messages) == 2
 
-    # Verify types are preserved
-    req = loaded.messages[0]
-    resp = loaded.messages[1]
-    assert isinstance(req, ModelRequest)
-    assert isinstance(resp, ModelResponse)
-    assert req.parts[0].content == "hello"  # type: ignore[union-attr]
-    assert resp.parts[0].content == "hi there"  # type: ignore[union-attr]
+    # Messages round-trip as plain dicts in Ollama-native shape
+    user, assistant = loaded.messages
+    assert user["role"] == "user"
+    assert user["content"] == "hello"
+    assert assistant["role"] == "assistant"
+    assert assistant["content"] == "hi there"
 
 
 def test_session_to_dict(tmp_path: Path) -> None:
@@ -72,9 +63,8 @@ def test_session_to_dict(tmp_path: Path) -> None:
     assert d["model"] == "gemma4:12b"
     assert isinstance(d["messages"], list)
     assert len(d["messages"]) == 2
-    # Messages should be JSON-serializable dicts
-    assert d["messages"][0]["kind"] == "request"
-    assert d["messages"][1]["kind"] == "response"
+    assert d["messages"][0]["role"] == "user"
+    assert d["messages"][1]["role"] == "assistant"
 
 
 def test_list_sessions(tmp_path: Path) -> None:
@@ -88,24 +78,16 @@ def test_list_sessions(tmp_path: Path) -> None:
     assert names == {"skill-a", "skill-b"}
 
 
-def test_session_disk_format_uses_type_adapter(tmp_path: Path) -> None:
-    """Verify on-disk format uses ModelMessagesTypeAdapter for messages."""
+def test_session_disk_format_is_ollama_native(tmp_path: Path) -> None:
+    """Messages on disk are plain dicts in /api/chat shape -- no type adapter."""
     session_dir = tmp_path / "sessions"
     store = SessionStore(session_dir)
     session = store.create("test-skill", "gemma4:12b")
     session.messages = _make_messages()
     store.save(session)
 
-    # Read raw JSON from disk
     raw = json.loads((session_dir / f"{session.session_id}.json").read_text())
-    assert "messages" in raw
-    assert raw["messages"][0]["kind"] == "request"
-    assert raw["messages"][1]["kind"] == "response"
-
-    # Verify messages can be deserialized by the type adapter directly
-    restored = ModelMessagesTypeAdapter.validate_python(raw["messages"])
-    assert len(restored) == 2
-    assert isinstance(restored[0], ModelRequest)
+    assert raw["messages"] == _make_messages()
 
 
 # -- Phase 1: atomic persistence --
@@ -148,8 +130,8 @@ def test_atomic_persist_cleans_tempfile_on_error(
 
     # Mutate and try to save — must raise
     session.messages = [
-        ModelRequest(parts=[UserPromptPart(content="updated")]),
-        ModelResponse(parts=[TextPart(content="updated")]),
+        {"role": "user", "content": "updated"},
+        {"role": "assistant", "content": "updated"},
     ]
     with pytest.raises(OSError, match="simulated rename failure"):
         store.save(session)

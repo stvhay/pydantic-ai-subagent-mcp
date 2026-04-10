@@ -17,13 +17,11 @@ class ServerConfig:
     default_model: str = "gemma4:26b"
     session_dir: str = ".subagent-sessions"
     inbox_dir: str = ".subagent-inbox"
-    streaming: bool = True
     # Path to a JSON file declaring external MCP servers whose tools
     # should be exposed to every subagent run. The file uses the
-    # standard `{"mcpServers": {<name>: {command, args, env}}}` shape
-    # consumed by `pydantic_ai.mcp.load_mcp_servers`. If the file is
-    # missing the server still boots -- subagents simply have no
-    # external MCP tools, only the BUILTIN_TOOLS.
+    # standard `{"mcpServers": {<name>: {command, args, env, cwd}}}`
+    # shape. If the file is missing the server still boots -- subagents
+    # simply have no external MCP tools, only the BUILTIN_TOOLS.
     mcp_servers_config: str = ".subagent-mcp.servers.json"
     # Server-wide cap on the number of in-flight skill turns across
     # all sessions. The session worker acquires a slot from the
@@ -53,12 +51,6 @@ class ServerConfig:
         if config_path.exists():
             data = json.loads(config_path.read_text())
 
-        # Parse SUBAGENT_MCP_STREAMING env override (truthy: 1/true/yes)
-        streaming_default = bool(data.get("streaming", cls.streaming))
-        streaming_env = os.environ.get("SUBAGENT_MCP_STREAMING")
-        if streaming_env is not None:
-            streaming_default = streaming_env.strip().lower() in ("1", "true", "yes")
-
         # Backpressure knobs: env overrides config file overrides class default.
         # Both must be positive ints; non-positive or unparseable values fall
         # back to the class default rather than crashing the server at boot.
@@ -84,7 +76,6 @@ class ServerConfig:
             ),
             session_dir=data.get("session_dir", cls.session_dir),
             inbox_dir=data.get("inbox_dir", cls.inbox_dir),
-            streaming=streaming_default,
             max_concurrent_runs=max_concurrent,
             mailbox_max_depth=mailbox_max,
             mcp_servers_config=data.get(
