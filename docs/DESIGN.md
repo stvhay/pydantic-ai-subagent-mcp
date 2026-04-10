@@ -14,20 +14,25 @@ serves as the tool description.
 ## Session Management
 
 Sessions are UUID-keyed JSON files stored in the configured `session_dir`.
-Each session stores the pydantic-ai native message format (serialized via
-`ModelMessagesTypeAdapter`) to preserve tool call/result structure across turns.
+Each session stores messages in Ollama's /api/chat wire shape --
+`list[dict[str, Any]]` with roles `system`, `user`, `assistant`, and `tool`.
+Persistence is plain `json.dumps`/`json.loads` with no translation layer.
 
-Resuming a session passes the stored messages as `message_history` to
-`Agent.run()`, allowing the model to see the full conversation including
-tool interactions.
+Resuming a session passes the stored message list into `run_agent`, which
+appends the new user message and continues the multi-turn loop. Tool
+call/result structure is preserved natively because the wire shape already
+carries `tool_calls` on assistant turns and `tool_name` on tool turns.
 
 ## Streaming
 
-Skill execution uses `agent.run_stream()` when `config.streaming` is true (the
-default). Text deltas from the model are appended to `{session_dir}/{session_id}.log`
-and flushed after each chunk, while the final complete response is returned
-from the MCP tool as before — the MCP protocol requires tool results to be
-complete, so streaming is a side-channel, not a change to the tool return
+Skill execution uses `run_agent` with an `on_content_delta` callback when
+`config.streaming` is true (the default). Internally, `OllamaClient.chat_stream`
+yields NDJSON `StreamChunk`s from /api/chat; `chat_turn` accumulates them into a
+`TurnResult` and pushes each text delta through the callback. The callback in
+`_run_skill_streaming` (server.py) appends each chunk to
+`{session_dir}/{session_id}.log` and flushes, while the final complete response
+is returned from the MCP tool as before -- the MCP protocol requires tool results
+to be complete, so streaming is a side-channel, not a change to the tool return
 contract.
 
 Each turn of a multi-turn session appends a new `--- prompt ---` /
@@ -118,9 +123,12 @@ The tool returns `{session_id, status, in_flight_cancelled, queued_dropped}`. St
 
 ## Recursive Sub-Agents
 
-Agents can spawn sub-agents by calling this same MCP server through
-pydantic-ai's `MCPServerStdio` toolset. Recursion depth is bounded by
-configuration (`max_recursion_depth`) to prevent infinite loops.
+Agents can spawn sub-agents by calling this same MCP server through the
+external MCP server injection path: the server declares itself in
+`.subagent-mcp.servers.json`, `MCPToolLoader` spawns it as a long-lived
+child, and its tools appear as `Tool` shims alongside the built-in tools.
+Recursion depth is bounded by configuration (`max_recursion_depth`) to
+prevent infinite loops.
 
 ## Security Considerations
 
