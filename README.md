@@ -1,6 +1,6 @@
 # pydantic-ai-subagent-mcp
 
-MCP server that proxies Claude Code skills to local Ollama models (gemma4 family) via pydantic-ai agents.
+MCP server that proxies Claude Code skills to local Ollama models (gemma4 family) via a native /api/chat agent loop.
 
 ## What it does
 
@@ -8,7 +8,7 @@ When loaded as an MCP server in Claude Code, it:
 
 1. **Discovers skills** from Claude Code's command directories and installed plugins
 2. **Registers each skill as an MCP tool** with optional model and session parameters
-3. **Delegates execution** to a pydantic-ai agent backed by Ollama, with a rich set of built-in tools (file I/O, code search, shell execution, srclight)
+3. **Delegates execution** to a multi-turn agent loop over Ollama's /api/chat, with a rich set of built-in tools (file I/O, code search, shell execution) and optional external MCP tools (srclight, etc.)
 4. **Manages sessions** with UUID-keyed transcripts so conversations can be resumed
 5. **Supports recursive sub-agents** -- the spawned agent can itself use this MCP to create sub-sub-agents
 6. **Streams output incrementally** — with `streaming: true` (default), each skill run writes text deltas to a `<session_id>.log` file alongside the session JSON. Use the `tail_session_log` tool to poll for live output while a run is in progress.
@@ -47,7 +47,7 @@ Environment variables `OLLAMA_BASE_URL`, `SUBAGENT_MCP_DEFAULT_MODEL`, and `SUBA
 
 ### External MCP servers exposed to subagents
 
-Subagents can call tools from any external MCP server you declare in `.subagent-mcp.servers.json` (the path is configurable via `mcp_servers_config`). The schema follows pydantic-ai's `load_mcp_servers` -- a top-level `mcpServers` object keyed by server name, with `command` / `args` / `env` per stdio server. Env values support `${VAR}` and `${VAR:-default}` expansion. A copy of `.subagent-mcp.servers.json.example` (with `srclight` pre-wired) ships in the repo as a starting point.
+Subagents can call tools from any external MCP server you declare in `.subagent-mcp.servers.json` (the path is configurable via `mcp_servers_config`). The schema is a top-level `mcpServers` object keyed by server name, with `command` / `args` / `env` per stdio server. Env values support `${VAR}` and `${VAR:-default}` expansion. A copy of `.subagent-mcp.servers.json.example` (with `srclight` pre-wired) ships in the repo as a starting point.
 
 ```json
 {
@@ -64,7 +64,7 @@ Subagents can call tools from any external MCP server you declare in `.subagent-
 }
 ```
 
-Each subagent run wraps the agent in `async with agent:`, so server subprocesses are started fresh per turn and torn down on exit. A missing or malformed config file is logged and treated as empty -- the server still boots and subagents simply run with the built-in Python tools only.
+External MCP servers are spawned once at startup by `MCPToolLoader` and held open for the server's entire lifetime via `AsyncExitStack`, so subagent runs do not pay subprocess startup cost per turn. A missing or malformed config file is logged and treated as empty -- the server still boots and subagents simply run with the built-in Python tools only.
 
 ## Background runs and completion notifications
 
@@ -186,7 +186,7 @@ Claude Code
   |                     |-- on tool call:
   |                     |     |-- per-session mailbox + worker actor model
   |                     |     |-- server-wide concurrency semaphore
-  |                     |     |-- creates pydantic-ai Agent with Ollama model
+  |                     |     |-- runs agent loop via OllamaClient.chat_turn
   |                     |     |-- streams response to {session_id}.log
   |                     |     |-- writes completion notification to inbox
   |                     |     \-- returns result (foreground) or "running" (background)
