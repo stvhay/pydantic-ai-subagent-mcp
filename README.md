@@ -116,6 +116,10 @@ Two independent caps protect the server from runaway producers:
 
 Both knobs can be set in `.subagent-mcp.json` or overridden by `SUBAGENT_MCP_MAX_CONCURRENT_RUNS` and `SUBAGENT_MCP_MAILBOX_MAX_DEPTH`. Non-positive or unparseable values silently fall back to the defaults (a misconfigured backpressure knob must never crash the server at boot).
 
+### Shutdown
+
+- **`shutdown_timeout_seconds`** (default `5.0`) — how long the server waits for in-flight session workers to drain during shutdown. If workers do not exit within this window (e.g. a stuck Ollama call), teardown proceeds anyway — closing the Ollama HTTP client and MCP children destroys the transports stuck workers depend on. Set via `.subagent-mcp.json` or `SUBAGENT_MCP_SHUTDOWN_TIMEOUT`.
+
 ### Example: launch a background run, observe it, stop it
 
 ```text
