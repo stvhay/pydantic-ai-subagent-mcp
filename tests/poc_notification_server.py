@@ -29,6 +29,18 @@ mcp = FastMCP(
     ),
 )
 
+# Patch the low-level server so it advertises the claude/channel capability.
+# FastMCP doesn't expose experimental_capabilities, so we wrap the method.
+_orig_create_init = mcp._mcp_server.create_initialization_options  # type: ignore[attr-defined]
+
+
+def _patched_create_init(**kwargs: Any) -> Any:  # type: ignore[no-untyped-def]
+    kwargs.setdefault("experimental_capabilities", {"claude/channel": {}})
+    return _orig_create_init(**kwargs)
+
+
+mcp._mcp_server.create_initialization_options = _patched_create_init  # type: ignore[attr-defined,assignment]
+
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
