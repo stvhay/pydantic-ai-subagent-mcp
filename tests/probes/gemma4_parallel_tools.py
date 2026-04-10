@@ -202,7 +202,7 @@ async def probe_model(
     }
 
     # --- Turn 2a: Current shape (one assistant + N tool messages) ---
-    print(f"  [turn2a] Testing current ingestion shape ...", flush=True)
+    print("  [turn2a] Testing current ingestion shape ...", flush=True)
     msgs_2a = list(messages_base) + [assistant_multi]
     for name, res in tc_results:
         msgs_2a.append(_tool_result_msg(name, res))
@@ -230,9 +230,9 @@ async def probe_model(
         result["turn2a_error"] = str(exc)
 
     # --- Turn 2b: Fan-out shape (N x [assistant+tool]) ---
-    print(f"  [turn2b] Testing fan-out ingestion shape ...", flush=True)
+    print("  [turn2b] Testing fan-out ingestion shape ...", flush=True)
     msgs_2b = list(messages_base)
-    for tc, (name, res) in zip(actual_tcs, tc_results):
+    for tc, (name, res) in zip(actual_tcs, tc_results, strict=True):
         msgs_2b.append({
             "role": "assistant",
             "content": "",
